@@ -1,35 +1,26 @@
-# Campus Net Guardian — 项目规范
+# CUIT Helper — 开发约束
 
-## 目标与架构
+## 架构
 
-- 当前交付形态是 Windows Rust 原生桌面应用：托盘常驻、紧凑面板、登录时自启。不得新增 Windows Service、管理员权限依赖、浏览器认证路径或本地管理端口。
-- `native/src/auth.rs` 实现 HTTP 认证，`daemon.rs` 串行执行守护 / 手动登录 / WiFi 切换，`platform.rs` 封装 Windows WLAN 与用户启动目录，`ui.rs` 通过消息与后台通信，不在 UI 线程联网或等待 WiFi。
-- 仓库与发布包仅包含 Rust 实现，不保留 Python 源码或脚本。旧版性能对比材料仅可存在本地忽略目录，不提交或上传。
-- 配置兼容根目录 `config.example.yaml` 的 YAML；GUI 仅持久化白名单覆盖项到用户目录 `gui_settings.json`，不得回写 YAML 或把账号 / 门户地址放入 GUI 覆盖层。
-- 原生图标使用 `logo.png` 和 `assets/app.ico`，主色 `#037EFE`；PNG 与 ICO 同源，按真实 DPI 载入标题栏 / 任务栏 / 托盘，不放大小位图或膨胀透明通道。
-- 面板显示状态、最近登录、下次探测和当前 SSID；高频动作仅立即登录、暂停 / 恢复，详细配置放同一窗口内的设置页，点击返回回到状态页，不另开窗口。关闭隐藏到托盘，退出需确认。浅色 / 深色遵循系统设置。
+- Windows Rust 原生桌面应用，使用 Iced 与 tiny-skia；保持单进程、普通用户权限，不引入服务、WebView 或本地管理端口。
+- `auth.rs` 负责认证，`daemon.rs` 串行执行网络工作，`platform.rs` 封装 Windows 能力；UI 通过消息通信，不在界面线程联网或等待 WiFi。托盘在窗口事件循环线程管理。
+- 设置在同一窗口自动保存；校验、防抖及异步回执不得丢失草稿。主网络修改重启生效，自启仅在用户明确切换时修改；退出须完成待保存设置或提供明确放弃入口。
 
-## 隐私与安全
+## 配置与安全
 
-- 真实账密、校园名、SSID、MAC、门户 / NAS / 用户 IP、sessionId、ticket、Cookie 不得进入代码、文档、测试、提交消息或 Release。真实值仅保留本地 gitignored 配置 / GUI 设置。
-- 测试全部使用合成值，不从真实环境复制。原始 HAR 必须先脱敏，不得直接提交。
-- HTTP 禁用系统代理；认证每次动态绑定 WLAN IPv4。凭据只提交到配置的 CAS origin；禁止向不可信重定向目标转发凭据，禁止日志打印原始 HTTP 响应 / 完整 URL / 会话。
-- WLAN profile 仅写当前用户，密码不落临时 XML；自启仅操作用户启动目录快捷方式。
-- 内存测量使用显式合成模式，不读真实账密、不联网、不更改 WiFi / 自启 / 用户设置。结果仅在聊天中说明，并注明场景和限制；仓库介绍与 Release 不放对比指标或实测报告。原始采样只留本地忽略目录，不编造运行结果。
-- 新增依赖先确认维护状况、兼容 license 与安全公告；提交 Cargo.lock，发布前运行隐私扫描与依赖审计。
+- 兼容 `config.example.yaml`。主网络与认证配置仅写本机 YAML；`gui_settings.json` 仅保存白名单偏好。配置写入须校验、原子替换并保留未修改字段。
+- 真实账密、网络与设备标识、会话、Cookie、未脱敏 HAR 不得进入代码、测试、日志、文档、提交或发布包。测试只用合成数据；预览不得读取真实配置或改变网络、自启、用户设置。未经明确授权，不进行真实登录、WiFi 切换或断网测试。
+- HTTP 禁用系统代理，认证动态绑定 WLAN IPv4；凭据仅发送至配置的 CAS origin，不向不可信重定向转发，不记录原始响应、完整 URL 或会话。WLAN profile 仅写当前用户，不生成含 WiFi 密码的临时 XML；自启仅操作用户启动目录。
 
-## 工程与验证
+## 质量
 
-- 改动保持范围明确，遵循既有模块边界；公开 API 使用中文文档注释。异常必须有可见失败反馈，不静默吞错或以默认成功掩盖故障。
-- 配置范围需验证；后台网络操作串行，暂停和退出可响应，退出取消后续认证步骤，重试计数仅在真实恢复后清零，时间间隔使用单调时钟。
-- 必须通过 `cargo fmt --all -- --check`、`cargo test --workspace --locked`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 和 release 构建。认证 / 状态机修复补回归测试。UI 需实际截图检查，跨 DPI 资源要验证。
-- 认证、并发、Windows FFI 等高风险改动优先独立审查实际 diff，修复阻断问题后复验。审查者默认只读，主 Agent 负责修复和验收。
-- 不自动编写进度、交接或重复代码真相的文档。维护具有持续价值的配置 / 协议 / 操作契约；长说明使用中文。
+- 遵循现有模块边界，保持改动聚焦；公开 API 使用中文文档注释。错误须可见，后台工作可取消，暂停与退出可响应，时间间隔使用单调时钟。
+- 新增依赖核查维护状况、许可证及安全公告，提交 `Cargo.lock`；发布前执行依赖审计和隐私扫描，按实际构建范围评估问题。
+- 必须通过 `cargo fmt --all -- --check`、`cargo test --workspace --locked`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 及 release 构建。缺陷修复补必要回归测试，UI 实际截图检查，图标验证跨 DPI 表现；认证、并发和 Windows FFI 等高风险改动优先独立只读审查。
+- 文档仅保留长期有效的约束与契约，不记录排障过程、临时进度或重复代码事实。性能采样仅留本地忽略目录，结果在聊天说明，不写入仓库或 Release。
 
-## Git 与发布
+## 交付
 
-- 主分支 `main`，开发必须在临时分支 `<type>-yymmdd-<desc>`，不得直接在 main 开发提交；同一任务使用现有分支闭环。
-- 合并前展示并审查实际 `git diff main..<branch>`，必要验证通过后 squash 合并；主分支一个完整任务一个 commit，格式 `<type>(<scope>): <summary>`；保留开发分支。
-- 不覆盖已有未提交修改、不执行强制推送 / hard reset / clean、不改写共享历史。
-- GitHub 交付目标 `https://github.com/Chenpi-Sakura/campus-net-guardian.git`；保留已配置 GitCode 远端。推送前扫描工作树和全部可达历史的已知真实敏感值。
-- Release 只包含经测试的 Windows exe、配置模板、README、LICENSE 和校验和，不包含本地配置、日志、HAR 或构建缓存。仅在明确授权发布时发布；区分实现、测试、本地合并、远端推送与公开 Release 的实际状态。
+- 主分支为 `main`；在 `<type>-yymmdd-<desc>` 临时分支开发，同一任务沿用现有分支。审查实际 `git diff main..<branch>`，验证后 squash 合并；一个任务一个提交，格式 `<type>(<scope>): <summary>`，保留开发分支。
+- 不覆盖已有未提交修改，不执行强制推送、hard reset 或 clean，不改写共享历史。验证通过后自主提交、合并并推送至已授权远端，保留 GitCode 远端配置。
+- Release 须有明确授权，仅包含经验证的 exe、配置模板、使用说明、许可证及第三方声明、校验和。推送前扫描工作树及全部可达历史；如实区分实现、验证、合并、推送和发布状态。

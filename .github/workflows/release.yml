@@ -27,6 +27,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --workspace --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p iced_tiny_skia --lib --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo clippy --workspace --all-targets --locked -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build and package

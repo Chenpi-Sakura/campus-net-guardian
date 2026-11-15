@@ -1,1556 +1,1768 @@
-//! Windows 原生面板：GDI 绘制、系统控件与托盘，不嵌入浏览器。
-#![allow(clippy::undocumented_unsafe_blocks)]
+//! Iced 单窗面板；后台串行执行网络工作，预览与真实配置完全隔离。
+mod appearance;
+mod autosave;
+mod motion;
+mod scroll_edge;
+mod shutdown;
+mod smooth_scroll;
+mod tray;
+mod view;
+mod window_icons;
 
 use crate::{
-    config::{self, AppConfig, GuiOverrides},
+    config::{
+        self, AppConfig, Appearance, ColorOverrides, GuiOverrides, PrimaryPatch, PrimarySettings,
+        ThemeMode, ThemeStyle,
+    },
     daemon::{Command, Event, Snapshot, Status, Worker},
     platform,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use autosave::Autosave;
+use iced::{Element, Font, Size, Subscription, Task, Theme, window};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
-    mem::{size_of, zeroed},
+    collections::VecDeque,
+    fmt,
     path::PathBuf,
-    ptr::{null, null_mut},
-    time::Instant,
-};
-use windows_sys::Win32::{
-    Foundation::*,
-    Graphics::{Dwm::*, Gdi::*},
-    System::{LibraryLoader::GetModuleHandleW, Registry::*, Threading::CreateMutexW},
-    UI::{
-        Controls::*, HiDpi::*, Input::KeyboardAndMouse::EnableWindow, Shell::*,
-        WindowsAndMessaging::*,
-    },
+    sync::mpsc,
+    time::{Duration, Instant, SystemTime},
 };
 
-const BLUE: u32 = rgb(3, 126, 254);
-const CLASS: &str = "CampusGuardian.Native.2";
-const TRAY: u32 = WM_APP + 1;
-const CREATE_SETTINGS: u32 = WM_APP + 2;
-const LOGIN: usize = 10;
-const PAUSE: usize = 11;
-const OPTIONS: usize = 12;
-const EXIT: usize = 13;
-const SHOW: usize = 14;
-const SAVE: usize = 20;
-const SCAN: usize = 21;
-const CONFIG: usize = 22;
-const LOG: usize = 23;
-const BACK: usize = 24;
-
-const fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Home,
+    Settings,
 }
-// Win32 MAKEINTRESOURCEW 的整数资源 ID，系统不会把它作为地址解引用。
-#[allow(clippy::manual_dangling_ptr)]
-fn icon_resource() -> *const u16 {
-    1usize as *const u16
-}
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(Some(0)).collect()
-}
-
-struct App {
-    hwnd: HWND,
-    settings: HWND,
-    worker: Option<Worker>,
-    config_path: PathBuf,
-    overrides: GuiOverrides,
-    effective: AppConfig,
-    base: AppConfig,
-    pending: Option<GuiOverrides>,
-    snapshot: Option<Snapshot>,
-    logs: VecDeque<String>,
-    startup_error: String,
-    dark: bool,
-    background: HBRUSH,
-    surface: HBRUSH,
-    small_icon: HICON,
-    big_icon: HICON,
-    font: HFONT,
-    fonts: HashMap<usize, HFONT>,
-    icons: HashMap<usize, (HICON, HICON)>,
-    tray: bool,
-    benchmark: bool,
-    autostart: bool,
-    taskbar_created: u32,
-    form_checks: [bool; 3],
-    form_choices: [usize; 3],
-}
-
-impl App {
-    fn send(&self, command: Command) {
-        if let Some(worker) = &self.worker {
-            let _ = worker.commands.send(command);
+macro_rules! choices {
+    ($name:ident, $ty:ty, [$($value:literal),+], $unit:literal) => {
+        #[derive(Clone, Copy, PartialEq, Eq)] struct $name($ty);
+        impl $name { const ALL: &'static [Self] = &[$(Self($value)),+]; }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                if Self::ALL.contains(self) {write!(f, concat!("{}", $unit), self.0)}
+                else {write!(f, concat!("{}", $unit, "（配置文件）"), self.0)}
+            }
         }
     }
-    fn log(&mut self, message: String) {
+}
+choices!(IntervalChoice, u64, [15, 30, 60, 120], " 秒");
+choices!(ThresholdChoice, u32, [2, 3, 5], " 次");
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceChoice {
+    Mobile,
+    Telecom,
+    Unicom,
+    Unknown,
+}
+impl ServiceChoice {
+    const ALL: &'static [Self] = &[Self::Mobile, Self::Telecom, Self::Unicom];
+    fn code(self) -> &'static str {
+        match self {
+            Self::Mobile => "cmcc",
+            Self::Telecom => "ctcc",
+            Self::Unicom => "unicom",
+            Self::Unknown => "",
+        }
+    }
+    fn from_code(code: &str) -> Self {
+        match code {
+            "ctcc" => Self::Telecom,
+            "unicom" => Self::Unicom,
+            "cmcc" => Self::Mobile,
+            _ => Self::Unknown,
+        }
+    }
+}
+impl fmt::Display for ServiceChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Mobile => "中国移动",
+            Self::Telecom => "中国电信",
+            Self::Unicom => "中国联通",
+            Self::Unknown => "请选择运营商",
+        })
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RecoveryChoice(u64);
+impl RecoveryChoice {
+    const ALL: &'static [Self] = &[Self(0), Self(300), Self(900)];
+}
+impl fmt::Display for RecoveryChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0 => f.write_str("手动切回"),
+            300 => f.write_str("每 5 分钟尝试"),
+            900 => f.write_str("每 15 分钟尝试"),
+            n => write!(f, "每 {n} 秒（配置文件）"),
+        }
+    }
+}
+struct Form {
+    primary_ssid: String,
+    username: String,
+    account_password: String,
+    account_password_visible: bool,
+    service: ServiceChoice,
+    original_service: String,
+    entry_url: String,
+    api_base: String,
+    probe_url: String,
+    autostart: bool,
+    fallback_enabled: bool,
+    ssid: String,
+    password: String,
+    interval: IntervalChoice,
+    threshold: ThresholdChoice,
+    recovery: RecoveryChoice,
+    debug: bool,
+    password_visible: bool,
+    mode: ThemeMode,
+    style: ThemeStyle,
+    accent: String,
+    background: String,
+    surface: String,
+    text: String,
+    appearance: Appearance,
+}
+impl Form {
+    fn new(config: &AppConfig, appearance: Appearance, autostart: bool, system_dark: bool) -> Self {
+        let [accent, background, surface, text] = appearance::fields(&appearance, system_dark);
+        Self {
+            primary_ssid: config.wifi.ssid.clone(),
+            username: config.account.username.clone(),
+            account_password: config.account.password.clone(),
+            account_password_visible: false,
+            service: ServiceChoice::from_code(&config.portal.service),
+            original_service: config.portal.service.clone(),
+            entry_url: config.portal.entry_url.clone(),
+            api_base: config.portal.api_base.clone(),
+            probe_url: config.portal.probe_url.clone(),
+            autostart,
+            fallback_enabled: config.wifi.fallback.enabled,
+            ssid: config.wifi.fallback.ssid.clone(),
+            password: config.wifi.fallback.password.clone(),
+            interval: IntervalChoice(config.daemon.probe_interval),
+            threshold: ThresholdChoice(config.daemon.failure_threshold),
+            recovery: RecoveryChoice(config.wifi.fallback.switch_back_interval),
+            debug: config.logging.level == "DEBUG",
+            password_visible: false,
+            mode: appearance.mode,
+            style: appearance.style,
+            accent,
+            background,
+            surface,
+            text,
+            appearance,
+        }
+    }
+    fn load_colors(&mut self, system_dark: bool) {
+        [self.accent, self.background, self.surface, self.text] =
+            appearance::fields(&self.appearance, system_dark);
+    }
+    fn primary_settings(&self) -> PrimarySettings {
+        PrimarySettings {
+            ssid: self.primary_ssid.clone(),
+            username: self.username.trim().into(),
+            password: self.account_password.clone(),
+            service: if self.service == ServiceChoice::Unknown {
+                self.original_service.clone()
+            } else {
+                self.service.code().into()
+            },
+            entry_url: self.entry_url.trim().into(),
+            api_base: self.api_base.trim().into(),
+            probe_url: self.probe_url.trim().into(),
+        }
+    }
+    fn validate_primary(&self, config: &AppConfig) -> Result<()> {
+        let mut candidate = config.clone();
+        let fields = self.primary_settings();
+        candidate.wifi.ssid = fields.ssid;
+        candidate.account.username = fields.username;
+        candidate.account.password = fields.password;
+        candidate.portal.service = fields.service;
+        candidate.portal.entry_url = fields.entry_url;
+        candidate.portal.api_base = fields.api_base;
+        candidate.portal.probe_url = fields.probe_url;
+        candidate.validate()
+    }
+    fn capture_colors(&mut self, system_dark: bool) -> Result<()> {
+        let mut next = self.appearance.clone();
+        let dark = appearance::is_dark(&next, system_dark);
+        *next.colors_mut(dark) = ColorOverrides {
+            accent_color: Some(self.accent.clone()),
+            background_color: Some(self.background.clone()),
+            surface_color: Some(self.surface.clone()),
+            text_color: Some(self.text.clone()),
+        };
+        next.validate()?;
+        self.appearance = next;
+        Ok(())
+    }
+    fn overrides(&self, previous: &GuiOverrides, config: &AppConfig) -> GuiOverrides {
+        GuiOverrides {
+            probe_interval: if IntervalChoice::ALL.contains(&self.interval) {
+                Some(self.interval.0)
+            } else {
+                previous.probe_interval
+            },
+            failure_threshold: if ThresholdChoice::ALL.contains(&self.threshold) {
+                Some(self.threshold.0)
+            } else {
+                previous.failure_threshold
+            },
+            switch_back_interval: if RecoveryChoice::ALL.contains(&self.recovery) {
+                Some(self.recovery.0)
+            } else {
+                previous.switch_back_interval
+            },
+            fallback_enabled: Some(self.fallback_enabled),
+            fallback_ssid: Some(self.ssid.trim().into()),
+            fallback_password: Some(self.password.clone()),
+            log_level: if self.debug {
+                Some("DEBUG".into())
+            } else if config.logging.level == "DEBUG" {
+                Some("INFO".into())
+            } else {
+                previous.log_level.clone()
+            },
+            appearance: Some(self.appearance.clone()),
+        }
+    }
+
+    fn prepared_overrides(
+        &mut self,
+        previous: &GuiOverrides,
+        config: &AppConfig,
+        base: &AppConfig,
+        system_dark: bool,
+    ) -> Result<GuiOverrides> {
+        self.capture_colors(system_dark)?;
+        appearance::validate(&self.appearance)?;
+        let ssid = self.ssid.trim();
+        if ssid.len() > 32 || ssid.contains('\0') {
+            bail!("备用 WiFi 名称必须最多 32 字节且不含 NUL");
+        }
+        if self.fallback_enabled && (ssid.is_empty() || ssid == "__FALLBACK_WIFI_SSID__") {
+            bail!("请先填写备用 WiFi 名称，再开启备用网络");
+        }
+        let overrides = self.overrides(previous, config);
+        if base.validate().is_ok() {
+            base.effective(&overrides).validate()?;
+        }
+        Ok(overrides)
+    }
+}
+
+struct PendingSave {
+    overrides: GuiOverrides,
+    primary_settings: PrimarySettings,
+    autostart: Option<(bool, u64)>,
+    revision: u64,
+}
+
+#[derive(Clone)]
+enum Message {
+    Tick,
+    Opened(window::Id),
+    CloseRequested(window::Id),
+    SystemTheme(iced::theme::Mode),
+    Scale(f32),
+    IconsReady,
+    Login,
+    TogglePause,
+    OpenSettings,
+    Back,
+    PrimarySsid(String),
+    Username(String),
+    AccountPassword(String),
+    ToggleAccountPassword,
+    Service(ServiceChoice),
+    EntryUrl(String),
+    ApiBase(String),
+    ProbeUrl(String),
+    TogglePortal,
+    Autostart(bool),
+    Fallback(bool),
+    Ssid(String),
+    Password(String),
+    TogglePassword,
+    Recovery(RecoveryChoice),
+    Interval(IntervalChoice),
+    Threshold(ThresholdChoice),
+    Debug(bool),
+    Scan,
+    OpenConfig,
+    OpenLog,
+    RequestExit,
+    CancelExit,
+    ConfirmExit,
+    DiscardAndExit,
+    Mode(ThemeMode),
+    Style(ThemeStyle),
+    Accent(String),
+    Background(String),
+    Surface(String),
+    TextColor(String),
+    ResetColors,
+    ToggleColors,
+}
+// Iced 调试输出不得携带备用网络名称和密码。
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tick => "Tick",
+            Self::Opened(_) => "Opened",
+            Self::CloseRequested(_) => "CloseRequested",
+            Self::SystemTheme(_) => "SystemTheme",
+            Self::Scale(_) => "Scale",
+            Self::IconsReady => "IconsReady",
+            Self::Login => "Login",
+            Self::TogglePause => "TogglePause",
+            Self::OpenSettings => "OpenSettings",
+            Self::Back => "Back",
+            Self::PrimarySsid(_) => "PrimarySsid([REDACTED])",
+            Self::Username(_) => "Username([REDACTED])",
+            Self::AccountPassword(_) => "AccountPassword([REDACTED])",
+            Self::ToggleAccountPassword => "ToggleAccountPassword",
+            Self::Service(_) => "Service",
+            Self::EntryUrl(_) => "EntryUrl([REDACTED])",
+            Self::ApiBase(_) => "ApiBase([REDACTED])",
+            Self::ProbeUrl(_) => "ProbeUrl([REDACTED])",
+            Self::TogglePortal => "TogglePortal",
+            Self::Autostart(_) => "Autostart",
+            Self::Fallback(_) => "Fallback",
+            Self::Ssid(_) => "Ssid([REDACTED])",
+            Self::Password(_) => "Password([REDACTED])",
+            Self::TogglePassword => "TogglePassword",
+            Self::Recovery(_) => "Recovery",
+            Self::Interval(_) => "Interval",
+            Self::Threshold(_) => "Threshold",
+            Self::Debug(_) => "Debug",
+            Self::Scan => "Scan",
+            Self::OpenConfig => "OpenConfig",
+            Self::OpenLog => "OpenLog",
+            Self::RequestExit => "RequestExit",
+            Self::CancelExit => "CancelExit",
+            Self::ConfirmExit => "ConfirmExit",
+            Self::DiscardAndExit => "DiscardAndExit",
+            Self::Mode(_) => "Mode",
+            Self::Style(_) => "Style",
+            Self::Accent(_) => "Accent",
+            Self::Background(_) => "Background",
+            Self::Surface(_) => "Surface",
+            Self::TextColor(_) => "TextColor",
+            Self::ResetColors => "ResetColors",
+            Self::ToggleColors => "ToggleColors",
+        })
+    }
+}
+struct App {
+    page: Page,
+    snapshot: Snapshot,
+    startup_error: Option<String>,
+    logs: VecDeque<String>,
+    effective: AppConfig,
+    form: Form,
+    networks: Vec<String>,
+    networks_revision: u64,
+    pending: bool,
+    feedback: Option<String>,
+    preview: bool,
+    start_paused: bool,
+    exit_confirm: bool,
+    exit_error: Option<String>,
+    discard_on_exit: bool,
+    logo: iced::widget::image::Handle,
+    advanced_colors: bool,
+    advanced_portal: bool,
+    primary_saved: PrimarySettings,
+    base: AppConfig,
+    overrides: GuiOverrides,
+    system_dark: bool,
+    worker: Option<Worker>,
+    tray: Option<tray::Tray>,
+    _guard: tray::InstanceGuard,
+    window: window::Id,
+    visible: bool,
+    config_path: PathBuf,
+    saving: Option<PendingSave>,
+    save_warning: Option<&'static str>,
+    autostart_requested: Option<(bool, u64)>,
+    autostart_intent: Option<(bool, u64)>,
+    autostart_generation: u64,
+    autosave: Autosave,
+    shutdown: Option<mpsc::Receiver<shutdown::Outcome>>,
+    exit_plan: Option<shutdown::Plan>,
+    shutdown_thread: Option<std::thread::JoinHandle<()>>,
+    preview_login: Option<Instant>,
+    icon_scale: f32,
+    logo_color: [u8; 3],
+    cached_theme: Theme,
+    theme_appearance: Appearance,
+    theme_dark: bool,
+}
+impl App {
+    fn refresh_native(&mut self) -> Task<Message> {
+        let colors = &self.form.appearance;
+        if self.theme_appearance != *colors || self.theme_dark != self.system_dark {
+            let candidate = appearance::theme(colors, self.system_dark);
+            let palette = candidate.palette();
+            // 编辑背景与文字的中间步骤可能暂时不可读，保留上一次可读预览，避免设置入口消失。
+            if palette.text.relative_contrast(palette.background) >= 4.5
+                && palette
+                    .text
+                    .relative_contrast(candidate.extended_palette().background.weak.color)
+                    >= 4.5
+            {
+                self.cached_theme = candidate;
+                self.theme_appearance = colors.clone();
+                self.theme_dark = self.system_dark;
+            }
+        }
+        let background = self.cached_theme.palette().background;
+        let dark = background.r + background.g + background.b < 1.5;
+        let color = self.cached_theme.palette().primary;
+        let accent = [color.r, color.g, color.b].map(|n| (n * 255.0).round() as u8);
+        if accent != self.logo_color
+            && let Ok(logo) = load_logo(self.icon_scale, accent)
+        {
+            self.logo = logo;
+            self.logo_color = accent;
+        }
+        if let Some(tray) = &mut self.tray
+            && tray.set_accent(accent).is_err()
+        {
+            self.feedback = Some("托盘图标更新失败，其他设置仍然有效".into());
+        }
+        window_icons::refresh(self.window, dark, accent).map(|()| Message::IconsReady)
+    }
+    fn view(&self, _: window::Id) -> Element<'_, Message> {
+        view::view(self)
+    }
+    fn theme(&self, _: window::Id) -> Theme {
+        self.cached_theme.clone()
+    }
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+            window::close_requests().map(Message::CloseRequested),
+            iced::system::theme_changes().map(Message::SystemTheme),
+            window::events().filter_map(|(_, event)| match event {
+                window::Event::Rescaled(scale) => Some(Message::Scale(scale)),
+                _ => None,
+            }),
+        ])
+    }
+    fn send(&mut self, command: Command) -> bool {
+        let ok = self
+            .worker
+            .as_ref()
+            .is_some_and(|w| w.commands.send(command).is_ok());
+        if !ok {
+            self.feedback = Some("后台守护未运行，请重新启动应用".into());
+        }
+        ok
+    }
+    fn log(&mut self, text: String) {
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
-        self.logs.push_back(message);
-        unsafe {
-            let text = self.logs.iter().cloned().collect::<Vec<_>>().join("\r\n");
-            let edit = GetDlgItem(self.hwnd, 100);
-            SetWindowTextW(edit, wide(&text).as_ptr());
-            ShowScrollBar(edit, SB_VERT, (self.logs.len() > 6) as i32);
-            SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
-            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
-        }
+        self.logs.push_back(text);
     }
-    fn bg(&self) -> u32 {
-        if self.dark {
-            rgb(18, 22, 29)
-        } else {
-            rgb(245, 247, 251)
-        }
+    fn edited(&mut self) {
+        self.autosave.edit(Instant::now());
+        self.feedback = None;
     }
-    fn card(&self) -> u32 {
-        if self.dark {
-            rgb(29, 35, 44)
-        } else {
-            rgb(255, 255, 255)
-        }
+    fn apply_saved_overrides(&mut self, overrides: GuiOverrides) {
+        self.effective = self.base.effective(&overrides);
+        self.overrides = overrides;
     }
-    fn fg(&self) -> u32 {
-        if self.dark {
-            rgb(237, 242, 249)
-        } else {
-            rgb(25, 37, 54)
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        if self.autostart_intent.is_none() {
+            self.form.autostart = snapshot.autostart;
         }
-    }
-    fn muted(&self) -> u32 {
-        if self.dark {
-            rgb(157, 172, 192)
-        } else {
-            rgb(100, 115, 136)
+        if let Some(tray) = &self.tray {
+            tray.set_paused(snapshot.paused);
         }
+        self.snapshot = snapshot;
     }
-}
-
-/// 显示不会包含配置内容的启动错误。
-pub fn show_error(message: &str) {
-    unsafe {
-        MessageBoxW(
-            null_mut(),
-            wide(message).as_ptr(),
-            wide("校园网守护").as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-}
-
-/// 启动原生界面；性能测量模式不读取账密、不联网、不更改自启。
-pub fn run(config_path: PathBuf, benchmark: bool, hidden: bool) -> Result<()> {
-    // 与旧版测量基线一致：保留一个等待中的后台线程，但不构造真实网络后端。
-    let (benchmark_stop, benchmark_wait) = std::sync::mpsc::channel::<()>();
-    let benchmark_thread = benchmark.then(|| {
-        std::thread::spawn(move || {
-            let _ = benchmark_wait.recv();
-        })
-    });
-    let drawing = crate::drawing::DrawingSession::start();
-    let antialias = drawing.is_ok();
-    let _drawing = drawing.ok();
-    unsafe {
-        let mutex = if benchmark {
-            null_mut()
-        } else {
-            CreateMutexW(null(), 0, wide("Local\\CampusGuardian.Native.2").as_ptr())
-        };
-        if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            let existing = FindWindowW(wide(CLASS).as_ptr(), null());
-            if !existing.is_null() {
-                ShowWindow(existing, SW_SHOW);
-                SetForegroundWindow(existing);
-            }
-            CloseHandle(mutex);
-            return Ok(());
-        }
-        let instance = GetModuleHandleW(null());
+    fn acknowledge_autostart(&mut self, enabled: bool, generation: u64) {
+        self.snapshot.autostart = enabled;
+        if self
+            .autostart_intent
+            .is_some_and(|(_, current)| current == generation)
         {
-            let class_name = wide(CLASS);
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(window_proc),
-                hInstance: instance,
-                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-                lpszClassName: class_name.as_ptr(),
-                ..zeroed()
-            };
-            if RegisterClassW(&wc) == 0 {
-                bail!("无法注册窗口类");
-            }
+            self.autostart_intent = None;
+            self.form.autostart = enabled;
         }
-        let dark = is_dark();
-        let overrides = if benchmark {
-            GuiOverrides::default()
-        } else {
-            GuiOverrides::load()
-        };
-        let mut startup_error = String::new();
-        let mut effective = AppConfig::default();
-        let mut base = AppConfig::default();
-        let worker = if benchmark {
-            None
-        } else {
-            if !config_path.exists() {
-                if let Some(parent) = config_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&config_path, include_str!("../../config.example.yaml"))?;
-            }
-            match AppConfig::load(&config_path) {
-                Ok(cfg) => {
-                    effective = cfg.effective(&overrides);
-                    base = cfg.clone();
-                    Some(Worker::start(cfg, overrides.clone()))
-                }
-                Err(error) => {
-                    startup_error = format!("请检查配置：{error}。打开配置文件修正后重启。");
-                    None
-                }
-            }
-        };
-        let state = Box::new(RefCell::new(App {
-            hwnd: null_mut(),
-            settings: null_mut(),
-            worker,
-            config_path,
-            overrides,
-            effective,
-            base,
-            pending: None,
-            snapshot: None,
-            logs: VecDeque::new(),
-            startup_error,
-            dark,
-            background: CreateSolidBrush(if dark {
-                rgb(18, 22, 29)
-            } else {
-                rgb(245, 247, 251)
-            }),
-            surface: CreateSolidBrush(if dark {
-                rgb(29, 35, 44)
-            } else {
-                rgb(255, 255, 255)
-            }),
-            small_icon: null_mut(),
-            big_icon: null_mut(),
-            font: null_mut(),
-            fonts: HashMap::new(),
-            icons: HashMap::new(),
-            tray: false,
-            benchmark,
-            autostart: !benchmark && platform::autostart_enabled(),
-            form_checks: [false; 3],
-            form_choices: [0, 1, 1],
-            taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
-        }));
-        let dpi = GetDpiForSystem().max(96);
-        let mut bounds = RECT {
-            left: 0,
-            top: 0,
-            right: scale(420, dpi),
-            bottom: scale(580, dpi),
-        };
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-        AdjustWindowRectExForDpi(&mut bounds, style, 0, 0, dpi);
-        let hwnd = CreateWindowExW(
-            0,
-            wide(CLASS).as_ptr(),
-            wide("校园网守护").as_ptr(),
-            style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            bounds.right - bounds.left,
-            bounds.bottom - bounds.top,
-            null_mut(),
-            null_mut(),
-            instance,
-            (&*state as *const RefCell<App>).cast(),
+    }
+    fn primary_exit_patch(&self, settings: &PrimarySettings) -> PrimaryPatch {
+        let mut patch = settings.patch_against(&self.primary_saved);
+        // 退出期间旧写入可能先完成；也覆盖这些字段的最新值，包括用户撤回的修改。
+        if let Some(pending) = &self.saving {
+            let inflight = settings.patch_against(&pending.primary_settings);
+            macro_rules! merge { ($($field:ident),+) => { $(if patch.$field.is_none() { patch.$field = inflight.$field; })+ }; }
+            merge!(
+                ssid, username, password, service, entry_url, api_base, probe_url
+            );
+        }
+        patch
+    }
+    fn prepare_exit_plan(&mut self) -> Result<shutdown::Plan> {
+        let overrides = self.form.prepared_overrides(
+            &self.overrides,
+            &self.effective,
+            &self.base,
+            self.system_dark,
+        )?;
+        let primary_settings = self.form.primary_settings();
+        let patch = self.primary_exit_patch(&primary_settings);
+        if !patch.is_empty() {
+            self.form.validate_primary(&self.effective)?;
+        }
+        Ok(shutdown::Plan {
+            primary: (!patch.is_empty()).then_some((patch, primary_settings)),
+            overrides: (self.autosave.is_dirty() || self.pending || self.saving.is_some())
+                .then_some(overrides),
+            autostart: self.autostart_intent,
+        })
+    }
+    fn begin_shutdown(&mut self, plan: shutdown::Plan) {
+        self.exit_confirm = true;
+        self.exit_error = None;
+        self.discard_on_exit = false;
+        self.pending = true;
+        self.feedback = Some("正在保存并结束后台守护…".into());
+        self.exit_plan = Some(plan.clone());
+        let (receiver, thread) = shutdown::launch(
+            self.worker.take(),
+            plan,
+            self.preview,
+            self.config_path.clone(),
         );
-        if hwnd.is_null() {
-            bail!("无法创建窗口");
-        }
-        let mut app = state.borrow_mut();
-        app.hwnd = hwnd;
-        let mut work: RECT = zeroed();
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
-        SetWindowPos(
-            hwnd,
-            null_mut(),
-            (work.right - (bounds.right - bounds.left) - scale(20, dpi)).max(0),
-            (work.bottom - (bounds.bottom - bounds.top) - scale(20, dpi)).max(0),
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER,
-        );
-        apply_icons(hwnd, &mut app);
-        let mut notify = tray_data(&app);
-        app.tray = Shell_NotifyIconW(NIM_ADD, &notify) != 0;
-        if app.tray {
-            notify.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &notify);
-        }
-        if !hidden || !app.tray {
-            ShowWindow(hwnd, SW_SHOW);
-        }
-        SetTimer(hwnd, 1, 500, None);
-        if benchmark {
-            app.log("性能测量模式 · 已禁用联网与配置写入".into());
-        }
-        if !antialias {
-            app.log("抗锯齿绘图不可用，已使用基础绘图模式".into());
-        }
-        drop(app);
-        // 首次 ShowWindow 可能遵循父进程的 STARTF_USESHOWWINDOW（隐藏启动）。
-        // 显式可见模式再显示一次，并在没有状态借用时完成首帧绘制。
-        if !hidden || !state.borrow().tray {
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
-        }
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if IsDialogMessageW(hwnd, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        let mut app = state.borrow_mut();
-        if app.tray {
-            Shell_NotifyIconW(NIM_DELETE, &tray_data(&app));
-        }
-        app.send(Command::Stop);
-        for font in app.fonts.values() {
-            DeleteObject(*font);
-        }
-        for (small, big) in app.icons.values() {
-            if !small.is_null() {
-                DestroyIcon(*small);
-            }
-            if !big.is_null() {
-                DestroyIcon(*big);
-            }
-        }
-        DeleteObject(app.background);
-        DeleteObject(app.surface);
-        let worker = app.worker.take();
-        drop(app);
-        if let Some(worker) = worker {
-            worker.join();
-        }
-        if !mutex.is_null() {
-            CloseHandle(mutex);
-        }
-        drop(benchmark_stop);
-        if let Some(thread) = benchmark_thread {
+        self.shutdown = Some(receiver);
+        self.shutdown_thread = Some(thread);
+    }
+    fn finish_shutdown(&mut self, outcome: shutdown::Outcome) -> Task<Message> {
+        self.shutdown = None;
+        if let Some(thread) = self.shutdown_thread.take() {
             let _ = thread.join();
         }
-        Ok(())
-    }
-}
-
-unsafe fn is_dark() -> bool {
-    unsafe {
-        let mut value: u32 = 1;
-        let mut len = 4;
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
-            wide("AppsUseLightTheme").as_ptr(),
-            RRF_RT_REG_DWORD,
-            null_mut(),
-            (&mut value as *mut u32).cast(),
-            &mut len,
-        );
-        value == 0
-    }
-}
-fn scale(value: i32, dpi: u32) -> i32 {
-    value * dpi as i32 / 96
-}
-unsafe fn apply_icons(hwnd: HWND, app: &mut App) {
-    unsafe {
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        let instance = GetModuleHandleW(null());
-        let small: HICON = LoadImageW(
-            instance,
-            icon_resource(),
-            IMAGE_ICON,
-            GetSystemMetricsForDpi(SM_CXSMICON, dpi),
-            GetSystemMetricsForDpi(SM_CYSMICON, dpi),
-            0,
-        )
-        .cast();
-        let big: HICON = LoadImageW(
-            instance,
-            icon_resource(),
-            IMAGE_ICON,
-            GetSystemMetricsForDpi(SM_CXICON, dpi),
-            GetSystemMetricsForDpi(SM_CYICON, dpi),
-            0,
-        )
-        .cast();
-        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
-        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
-        if hwnd == app.hwnd {
-            app.small_icon = small;
-            app.big_icon = big;
-            if app.tray {
-                Shell_NotifyIconW(NIM_MODIFY, &tray_data(app));
-            }
-        }
-        if let Some((old_small, old_big)) = app.icons.insert(hwnd as usize, (small, big)) {
-            if !old_small.is_null() {
-                DestroyIcon(old_small);
-            }
-            if !old_big.is_null() {
-                DestroyIcon(old_big);
-            }
-        }
-    }
-}
-unsafe fn tray_data(app: &App) -> NOTIFYICONDATAW {
-    unsafe {
-        let mut data: NOTIFYICONDATAW = zeroed();
-        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = app.hwnd;
-        data.uID = 1;
-        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        data.uCallbackMessage = TRAY;
-        data.hIcon = app.small_icon;
-        let tip = wide("校园网守护");
-        data.szTip[..tip.len()].copy_from_slice(&tip);
-        data
-    }
-}
-
-unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    unsafe {
-        if message == WM_NCCREATE {
-            let create = &*(l as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-        }
-        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
-        if pointer.is_null() {
-            return DefWindowProcW(hwnd, message, w, l);
-        }
-        let Ok(mut borrowed) = (*pointer).try_borrow_mut() else {
-            return DefWindowProcW(hwnd, message, w, l);
-        };
-        let app = &mut *borrowed;
-        if app.taskbar_created != 0 && message == app.taskbar_created && hwnd == app.hwnd {
-            let mut notify = tray_data(app);
-            app.tray = Shell_NotifyIconW(NIM_ADD, &notify) != 0;
-            if app.tray {
-                notify.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-                Shell_NotifyIconW(NIM_SETVERSION, &notify);
-            } else {
-                ShowWindow(hwnd, SW_SHOW);
-            }
-            return 0;
-        }
-        match message {
-            WM_SETTINGCHANGE | WM_THEMECHANGED => {
-                let dark = is_dark();
-                if dark != app.dark {
-                    app.dark = dark;
-                    DeleteObject(app.background);
-                    DeleteObject(app.surface);
-                    app.background = CreateSolidBrush(app.bg());
-                    app.surface = CreateSolidBrush(app.card());
-                    for win in [app.hwnd, app.settings] {
-                        if !win.is_null() {
-                            let enabled = dark as i32;
-                            DwmSetWindowAttribute(win, 20, (&enabled as *const i32).cast(), 4);
-                            RedrawWindow(win, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
-                        }
-                    }
-                }
-                return 0;
-            }
-            WM_CREATE => {
-                app.hwnd = hwnd;
-                build_controls(hwnd, app, false);
-                let dark = app.dark as i32;
-                DwmSetWindowAttribute(hwnd, 20, (&dark as *const i32).cast(), 4);
-                return 0;
-            }
-            CREATE_SETTINGS => {
-                clear_controls(hwnd);
-                app.settings = hwnd;
-                build_controls(hwnd, app, true);
-                InvalidateRect(hwnd, null(), 1);
-                return 0;
-            }
-            WM_ERASEBKGND => return 1,
-            WM_PAINT => {
-                paint(hwnd, app);
-                return 0;
-            }
-            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-                let dc = w as HDC;
-                SetTextColor(dc, app.fg());
-                SetBkColor(dc, app.card());
-                return app.surface as isize;
-            }
-            WM_DRAWITEM => {
-                draw_button(&*(l as *const DRAWITEMSTRUCT), app);
-                return 1;
-            }
-            WM_COMMAND => {
-                command(hwnd, app, w & 0xffff);
-                return 0;
-            }
-            WM_TIMER => {
-                let events: Vec<_> = app
-                    .worker
-                    .as_ref()
-                    .map(|worker| worker.events.try_iter().collect())
-                    .unwrap_or_default();
-                for event in events {
-                    match event {
-                        Event::Snapshot(snapshot) => {
-                            app.snapshot = Some(snapshot);
-                        }
-                        Event::Log(message) => app.log(message),
-                        Event::Networks(networks) => {
-                            if !app.settings.is_null() {
-                                pick_network(app.hwnd, &networks);
-                            }
-                        }
-                        Event::Autostart(enabled) => {
-                            app.autostart = enabled;
-                        }
-                        Event::SettingsSaved(success) => {
-                            if success {
-                                if let Some(settings) = app.pending.take() {
-                                    app.effective = app.base.effective(&settings);
-                                    app.overrides = settings;
-                                }
-                            } else {
-                                app.pending = None;
-                                show_error("守护设置保存失败，请查看最近动态。");
-                            }
-                        }
-                    }
-                }
-                if let Some(snapshot) = &app.snapshot {
-                    SetWindowTextW(
-                        GetDlgItem(app.hwnd, PAUSE as i32),
-                        wide(if snapshot.paused {
-                            "恢复守护"
-                        } else {
-                            "暂停守护"
-                        })
-                        .as_ptr(),
-                    );
-                    EnableWindow(GetDlgItem(app.hwnd, LOGIN as i32), (!snapshot.busy) as i32);
-                }
-                InvalidateRect(app.hwnd, null(), 0);
-                return 0;
-            }
-            TRAY => {
-                match (l as u32) & 0xffff {
-                    NIN_SELECT | 0x401 => {
-                        if IsWindowVisible(app.hwnd) != 0 {
-                            ShowWindow(app.hwnd, SW_HIDE);
-                        } else {
-                            ShowWindow(app.hwnd, SW_SHOW);
-                            SetForegroundWindow(app.hwnd);
-                        }
-                    }
-                    WM_CONTEXTMENU => {
-                        let menu = CreatePopupMenu();
-                        for (id, label) in [
-                            (SHOW, "打开面板"),
-                            (LOGIN, "立即登录"),
-                            (PAUSE, "暂停 / 恢复守护"),
-                            (EXIT, "退出"),
-                        ] {
-                            AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
-                        }
-                        let mut p: POINT = zeroed();
-                        GetCursorPos(&mut p);
-                        SetForegroundWindow(app.hwnd);
-                        let selected = TrackPopupMenu(
-                            menu,
-                            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                            p.x,
-                            p.y,
-                            0,
-                            app.hwnd,
-                            null(),
-                        );
-                        DestroyMenu(menu);
-                        if selected > 0 {
-                            PostMessageW(app.hwnd, WM_COMMAND, selected as usize, 0);
-                        }
-                    }
-                    _ => {}
-                }
-                return 0;
-            }
-            WM_DPICHANGED => {
-                let r = &*(l as *const RECT);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER,
-                );
-                apply_icons(hwnd, app);
-                update_font(hwnd, app);
-                layout_controls(hwnd, app, hwnd == app.settings);
-                InvalidateRect(hwnd, null(), 0);
-                return 0;
-            }
-            WM_CLOSE => {
-                if app.tray {
-                    ShowWindow(hwnd, SW_HIDE);
-                } else {
-                    command(hwnd, app, EXIT);
-                }
-                return 0;
-            }
-            WM_DESTROY => {
-                if hwnd == app.hwnd {
-                    PostQuitMessage(0);
-                } else {
-                    app.settings = null_mut();
-                }
-                return 0;
-            }
-            _ => {}
-        }
-        drop(borrowed);
-        DefWindowProcW(hwnd, message, w, l)
-    }
-}
-
-unsafe fn control(
-    hwnd: HWND,
-    class: &str,
-    label: &str,
-    id: usize,
-    style: u32,
-    rect: (i32, i32, i32, i32),
-    font: HFONT,
-) -> HWND {
-    unsafe {
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        let (x, y, w, h) = rect;
-        let child = CreateWindowExW(
-            0,
-            wide(class).as_ptr(),
-            wide(label).as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | style,
-            scale(x, dpi),
-            scale(y, dpi),
-            scale(w, dpi),
-            scale(h, dpi),
-            hwnd,
-            id as HMENU,
-            GetModuleHandleW(null()),
-            null(),
-        );
-        SendMessageW(child, WM_SETFONT, font as usize, 1);
-        if is_dark() {
-            SetWindowTheme(child, wide("DarkMode_Explorer").as_ptr(), null());
-        }
-        child
-    }
-}
-unsafe fn build_controls(hwnd: HWND, app: &mut App, settings: bool) {
-    unsafe {
-        update_font(hwnd, app);
-        let font = *app.fonts.get(&(hwnd as usize)).unwrap_or(&app.font);
-        if !settings {
-            control(
-                hwnd,
-                "BUTTON",
-                "立即登录",
-                LOGIN,
-                BS_OWNERDRAW as u32,
-                (28, 278, 176, 42),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "暂停守护",
-                PAUSE,
-                BS_OWNERDRAW as u32,
-                (216, 278, 176, 42),
-                font,
-            );
-            control(
-                hwnd,
-                "EDIT",
-                "",
-                100,
-                ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL,
-                (40, 376, 340, 130),
-                font,
-            );
-            ShowScrollBar(GetDlgItem(hwnd, 100), SB_VERT, 0);
-            control(
-                hwnd,
-                "BUTTON",
-                "设置",
-                OPTIONS,
-                BS_OWNERDRAW as u32,
-                (312, 536, 80, 30),
-                font,
-            );
-        } else {
-            control(
-                hwnd,
-                "BUTTON",
-                "返回",
-                BACK,
-                BS_OWNERDRAW as u32,
-                (312, 20, 80, 30),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "登录 Windows 时启动",
-                200,
-                BS_OWNERDRAW as u32,
-                (28, 78, 364, 28),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "主网不可用时使用备用网络",
-                201,
-                BS_OWNERDRAW as u32,
-                (28, 116, 364, 28),
-                font,
-            );
-            control(
-                hwnd,
-                "EDIT",
-                "",
-                202,
-                ES_AUTOHSCROLL as u32,
-                (170, 169, 146, 24),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "扫描",
-                SCAN,
-                BS_OWNERDRAW as u32,
-                (338, 164, 54, 30),
-                font,
-            );
-            control(
-                hwnd,
-                "EDIT",
-                "",
-                203,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32,
-                (170, 217, 210, 24),
-                font,
-            );
-            for (id, y) in [(204, 260), (205, 308), (206, 356)] {
-                control(
-                    hwnd,
-                    "BUTTON",
-                    "",
-                    id,
-                    BS_OWNERDRAW as u32,
-                    (158, y, 234, 34),
-                    font,
-                );
-            }
-            control(
-                hwnd,
-                "BUTTON",
-                "启用调试日志",
-                207,
-                BS_OWNERDRAW as u32,
-                (28, 406, 364, 28),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "打开配置文件",
-                CONFIG,
-                BS_OWNERDRAW as u32,
-                (28, 466, 176, 34),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "打开日志",
-                LOG,
-                BS_OWNERDRAW as u32,
-                (216, 466, 176, 34),
-                font,
-            );
-            control(
-                hwnd,
-                "BUTTON",
-                "保存设置",
-                SAVE,
-                BS_OWNERDRAW as u32,
-                (28, 526, 364, 42),
-                font,
-            );
-            app.form_checks = [
-                app.autostart,
-                app.effective.wifi.fallback.enabled,
-                app.effective.logging.level == "DEBUG",
-            ];
-            for (slot, id) in [200, 201, 207].iter().enumerate() {
-                update_toggle(hwnd, *id, slot, app);
-            }
-            EnableWindow(GetDlgItem(hwnd, SAVE as i32), app.pending.is_none() as i32);
-            SetWindowTextW(
-                GetDlgItem(hwnd, 202),
-                wide(&app.effective.wifi.fallback.ssid).as_ptr(),
-            );
-            SetWindowTextW(
-                GetDlgItem(hwnd, 203),
-                wide(&app.effective.wifi.fallback.password).as_ptr(),
-            );
-            for (slot, (id, value, values)) in [
-                (
-                    204,
-                    app.effective.wifi.fallback.switch_back_interval,
-                    vec![0, 300, 900],
-                ),
-                (
-                    205,
-                    app.effective.daemon.probe_interval,
-                    vec![15, 30, 60, 120],
-                ),
-                (
-                    206,
-                    app.effective.daemon.failure_threshold as u64,
-                    vec![2, 3, 5],
-                ),
-            ]
-            .into_iter()
-            .enumerate()
+        if let Some(plan) = self.exit_plan.take() {
+            if outcome.primary_saved
+                && let Some((_, settings)) = plan.primary
             {
-                app.form_choices[slot] = values
-                    .iter()
-                    .position(|v| *v == value)
-                    .unwrap_or(values.len());
-                update_choice(hwnd, id, slot, app);
+                self.primary_saved = settings;
             }
-        }
-    }
-}
-unsafe fn layout_controls(hwnd: HWND, _app: &App, settings: bool) {
-    unsafe {
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        let rects = if settings {
-            vec![
-                (BACK, 312, 20, 80, 30),
-                (200, 28, 78, 364, 28),
-                (201, 28, 116, 364, 28),
-                (202, 170, 169, 146, 24),
-                (SCAN, 338, 164, 54, 30),
-                (203, 170, 217, 210, 24),
-                (204, 158, 260, 234, 34),
-                (205, 158, 308, 234, 34),
-                (206, 158, 356, 234, 34),
-                (207, 28, 406, 364, 28),
-                (CONFIG, 28, 466, 176, 34),
-                (LOG, 216, 466, 176, 34),
-                (SAVE, 28, 526, 364, 42),
-            ]
-        } else {
-            vec![
-                (LOGIN, 28, 278, 176, 42),
-                (PAUSE, 216, 278, 176, 42),
-                (100, 40, 376, 340, 130),
-                (OPTIONS, 312, 536, 80, 30),
-            ]
-        };
-        for (id, x, y, w, h) in rects {
-            MoveWindow(
-                GetDlgItem(hwnd, id as i32),
-                scale(x, dpi),
-                scale(y, dpi),
-                scale(w, dpi),
-                scale(h, dpi),
-                1,
-            );
-        }
-    }
-}
-unsafe extern "system" fn set_child_font(hwnd: HWND, font: LPARAM) -> i32 {
-    unsafe {
-        SendMessageW(hwnd, WM_SETFONT, font as usize, 1);
-        1
-    }
-}
-unsafe fn update_font(hwnd: HWND, app: &mut App) {
-    unsafe {
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        let font = CreateFontW(
-            -scale(14, dpi),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide("Microsoft YaHei UI").as_ptr(),
-        );
-        EnumChildWindows(hwnd, Some(set_child_font), font as isize);
-        if let Some(old) = app.fonts.insert(hwnd as usize, font) {
-            DeleteObject(old);
-        }
-        if hwnd == app.hwnd {
-            app.font = font;
-        }
-    }
-}
-unsafe fn clear_controls(hwnd: HWND) {
-    unsafe {
-        let mut child = GetWindow(hwnd, GW_CHILD);
-        while !child.is_null() {
-            let next = GetWindow(child, GW_HWNDNEXT);
-            DestroyWindow(child);
-            child = next;
-        }
-    }
-}
-unsafe fn close_settings(app: &mut App) {
-    unsafe {
-        clear_controls(app.hwnd);
-        app.settings = null_mut();
-        build_controls(app.hwnd, app, false);
-        let text = app.logs.iter().cloned().collect::<Vec<_>>().join("\r\n");
-        let edit = GetDlgItem(app.hwnd, 100);
-        SetWindowTextW(edit, wide(&text).as_ptr());
-        ShowScrollBar(edit, SB_VERT, (app.logs.len() > 6) as i32);
-        InvalidateRect(app.hwnd, null(), 1);
-    }
-}
-unsafe fn text_of(hwnd: HWND, id: i32) -> String {
-    unsafe {
-        let child = GetDlgItem(hwnd, id);
-        let len = GetWindowTextLengthW(child).max(0) as usize;
-        let mut text = vec![0u16; len + 1];
-        GetWindowTextW(child, text.as_mut_ptr(), text.len() as i32);
-        String::from_utf16_lossy(&text[..len])
-    }
-}
-unsafe fn command(hwnd: HWND, app: &mut App, id: usize) {
-    unsafe {
-        match id {
-            SHOW => {
-                ShowWindow(app.hwnd, SW_SHOW);
-                SetForegroundWindow(app.hwnd);
-            }
-            LOGIN => app.send(Command::Login),
-            PAUSE => app.send(Command::Pause(
-                !app.snapshot.as_ref().is_some_and(|s| s.paused),
-            )),
-            OPTIONS => {
-                PostMessageW(app.hwnd, CREATE_SETTINGS, 0, 0);
-            }
-            BACK => close_settings(app),
-            CONFIG => {
-                if platform::open_file(&app.config_path).is_err() {
-                    show_error("无法打开配置文件，请检查文件关联。");
-                }
-            }
-            LOG => {
-                let path = if app.effective.logging.file.is_empty() {
-                    config::data_dir().join("guardian.log")
-                } else {
-                    PathBuf::from(&app.effective.logging.file)
-                };
-                if platform::open_file(&path).is_err() {
-                    show_error("日志文件尚未生成。");
-                }
-            }
-            SCAN => {
-                if !app.benchmark {
-                    app.send(Command::ScanNetworks);
-                }
-            }
-            200 | 201 | 207 => {
-                let slot = if id == 200 {
-                    0
-                } else if id == 201 {
-                    1
-                } else {
-                    2
-                };
-                app.form_checks[slot] = !app.form_checks[slot];
-                update_toggle(hwnd, id as i32, slot, app);
-            }
-            204..=206 => choose_option(hwnd, id as i32, app),
-            SAVE => {
-                if app.pending.is_some() {
-                    app.log("正在保存设置，请稍候".into());
-                    return;
-                }
-                if app.benchmark {
-                    MessageBoxW(
-                        hwnd,
-                        wide("性能测量模式不保存配置。").as_ptr(),
-                        wide("守护设置").as_ptr(),
-                        MB_OK,
-                    );
-                    return;
-                }
-                let selection = |id: usize| app.form_choices[id - 204];
-                let ov = GuiOverrides {
-                    fallback_enabled: Some(app.form_checks[1]),
-                    fallback_ssid: Some(text_of(hwnd, 202).trim().into()),
-                    fallback_password: Some(text_of(hwnd, 203)),
-                    switch_back_interval: [0, 300, 900].get(selection(204)).copied(),
-                    probe_interval: [15, 30, 60, 120].get(selection(205)).copied(),
-                    failure_threshold: [2, 3, 5].get(selection(206)).copied(),
-                    log_level: if app.form_checks[2] {
-                        Some("DEBUG".into())
-                    } else if app.effective.logging.level == "DEBUG" {
-                        Some("INFO".into())
-                    } else {
-                        app.overrides.log_level.clone()
-                    },
-                };
-                if ov.fallback_enabled == Some(true) && ov.fallback_ssid.as_deref() == Some("") {
-                    show_error("请先填写备用 WiFi 名称。");
-                    return;
-                }
-                let auto = app.form_checks[0];
-                if auto != app.autostart {
-                    app.send(Command::Autostart(auto, app.config_path.clone()));
-                }
-                if app.worker.is_none() {
-                    show_error("请先填写有效的校园网配置并重启，再保存守护设置。");
-                    return;
-                }
-                app.pending = Some(ov.clone());
-                app.send(Command::Settings(ov));
-                close_settings(app);
-            }
-            EXIT if app.benchmark
-                || MessageBoxW(
-                    app.hwnd,
-                    wide("退出后将停止自动重连，确定退出吗？").as_ptr(),
-                    wide("退出校园网守护").as_ptr(),
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-                ) == IDYES =>
+            if outcome.settings_saved
+                && let Some(overrides) = plan.overrides
             {
-                app.send(Command::Stop);
-                DestroyWindow(app.hwnd);
-                PostQuitMessage(0);
+                self.apply_saved_overrides(overrides);
             }
-            _ => {}
         }
-    }
-}
-
-struct Canvas {
-    dc: HDC,
-    dpi: u32,
-}
-impl Canvas {
-    unsafe fn rect(&self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: i32) {
-        unsafe {
-            let rect = RECT {
-                left: scale(x, self.dpi),
-                top: scale(y, self.dpi),
-                right: scale(x + w, self.dpi),
-                bottom: scale(y + h, self.dpi),
-            };
-            crate::drawing::rounded_rect(
-                self.dc,
-                &rect,
-                scale(radius, self.dpi) as f32 / 2.0,
-                color,
-            );
+        if let Some((enabled, generation)) = outcome.autostart {
+            self.acknowledge_autostart(enabled, generation);
         }
-    }
-    // 绘图调用直接表达坐标和字体，避免为一次绘制构造多层样式对象。
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn text(
-        &self,
-        text: &str,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        size: i32,
-        weight: i32,
-        color: u32,
-    ) {
-        unsafe {
-            let font = CreateFontW(
-                -scale(size, self.dpi),
-                0,
-                0,
-                0,
-                weight,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY as u32,
-                0,
-                wide("Microsoft YaHei UI").as_ptr(),
-            );
-            let old = SelectObject(self.dc, font);
-            SetTextColor(self.dc, color);
-            SetBkMode(self.dc, TRANSPARENT as i32);
-            let mut rect = RECT {
-                left: scale(x, self.dpi),
-                top: scale(y, self.dpi),
-                right: scale(x + w, self.dpi),
-                bottom: scale(y + h, self.dpi),
-            };
-            DrawTextW(
-                self.dc,
-                wide(text).as_ptr(),
-                -1,
-                &mut rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-            SelectObject(self.dc, old);
-            DeleteObject(font);
+        self.pending = false;
+        self.saving = None;
+        self.autostart_requested = None;
+        if let Some(error) = outcome.error {
+            self.autosave.finish(false);
+            self.snapshot.status = Status::Stopped;
+            self.snapshot.busy = false;
+            self.snapshot.next_probe = None;
+            self.startup_error =
+                Some("后台守护已停止，退出尚未完成；可重试保存或放弃修改退出".into());
+            self.feedback = Some(error.clone());
+            self.exit_error = Some(error);
+            self.discard_on_exit = true;
+            self.exit_confirm = true;
+            return self.show();
         }
+        iced::exit()
     }
-}
-unsafe fn paint(hwnd: HWND, app: &App) {
-    unsafe {
-        let mut ps: PAINTSTRUCT = zeroed();
-        let dc = BeginPaint(hwnd, &mut ps);
-        let mut bounds: RECT = zeroed();
-        GetClientRect(hwnd, &mut bounds);
-        let memory = CreateCompatibleDC(dc);
-        let bitmap = CreateCompatibleBitmap(dc, bounds.right.max(1), bounds.bottom.max(1));
-        let old = SelectObject(memory, bitmap);
-        FillRect(memory, &bounds, app.background);
-        let canvas = Canvas {
-            dc: memory,
-            dpi: GetDpiForWindow(hwnd).max(96),
-        };
-        if hwnd == app.settings {
-            canvas.text("守护设置", 28, 18, 364, 32, 22, 600, app.fg());
-            canvas.text(
-                "修改后下一轮生效 · 账号与门户地址保存在配置文件",
-                28,
-                51,
-                364,
-                22,
-                11,
-                400,
-                app.muted(),
-            );
-            canvas.rect(158, 164, 170, 34, app.card(), 10);
-            canvas.rect(158, 212, 234, 34, app.card(), 10);
-            for (y, label) in [
-                (164, "备用 WiFi"),
-                (212, "热点密码"),
-                (260, "切回校园网"),
-                (308, "探测间隔"),
-                (356, "掉线判定"),
-            ] {
-                canvas.text(label, 28, y, 120, 30, 14, 400, app.fg());
+    fn finish_save(&mut self, success: bool, message: &str) {
+        self.autosave.finish(success);
+        self.pending = false;
+        let warning = self.save_warning.take();
+        self.feedback = Some(
+            if let Some(warning) = warning {
+                warning
+            } else if success && self.autosave.is_dirty() {
+                "后续修改正在等待自动保存"
+            } else {
+                message
             }
-        } else {
-            DrawIconEx(
-                memory,
-                scale(28, canvas.dpi),
-                scale(26, canvas.dpi),
-                app.big_icon,
-                scale(32, canvas.dpi),
-                scale(32, canvas.dpi),
-                0,
-                null_mut(),
-                DI_NORMAL,
-            );
-            canvas.text("校园网守护", 72, 21, 270, 28, 20, 600, app.fg());
-            canvas.text("CAMPUS NET GUARDIAN", 73, 48, 270, 18, 10, 400, app.muted());
-            canvas.rect(28, 88, 364, 168, app.card(), 20);
-            let (label, color) = if app.benchmark {
-                ("网络已连接", rgb(38, 153, 103))
-            } else {
-                match app.snapshot.as_ref().map(|s| &s.status) {
-                    Some(Status::Online) => ("网络已连接", rgb(38, 153, 103)),
-                    Some(Status::Authenticating) => ("正在认证", BLUE),
-                    Some(Status::Fallback) => ("使用备用网络", BLUE),
-                    Some(Status::Paused) => ("守护已暂停", app.muted()),
-                    Some(Status::Starting) => ("正在启动", BLUE),
-                    Some(Status::Stopped) => ("守护已停止", app.muted()),
-                    _ if !app.startup_error.is_empty() => ("需要配置", rgb(205, 132, 28)),
-                    _ => ("网络未连接", rgb(215, 86, 86)),
-                }
-            };
-            canvas.rect(48, 113, 8, 8, color, 8);
-            canvas.text("当前状态", 64, 103, 280, 26, 12, 400, app.muted());
-            canvas.text(label, 48, 136, 324, 42, 28, 600, app.fg());
-            let detail = if app.benchmark {
-                "连接正常，正在为你保持在线。"
-            } else if !app.startup_error.is_empty() {
-                &app.startup_error
-            } else {
-                app.snapshot
-                    .as_ref()
-                    .map(|s| s.detail.as_str())
-                    .unwrap_or("正在准备网络守护…")
-            };
-            canvas.text(detail, 48, 183, 324, 24, 12, 400, app.muted());
-            let last = app
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.last_login)
-                .and_then(|t| t.elapsed().ok())
-                .map(|age| {
-                    if age.as_secs() < 60 {
-                        "最近登录：刚刚".into()
-                    } else {
-                        format!("最近登录：{} 分钟前", age.as_secs() / 60)
-                    }
-                })
-                .unwrap_or_else(|| "最近登录：—".into());
-            canvas.text(&last, 48, 206, 324, 18, 10, 400, app.muted());
-            let next = app
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.next_probe)
-                .map(|t| {
-                    format!(
-                        "下次检查 {} 秒",
-                        t.saturating_duration_since(Instant::now()).as_secs()
-                    )
-                })
-                .unwrap_or_else(|| "自动检查连接状态".into());
-            canvas.text(&next, 48, 230, 165, 22, 11, 400, app.muted());
-            let ssid = if app.benchmark {
-                "Campus_WiFi"
-            } else {
-                app.snapshot
-                    .as_ref()
-                    .map(|s| s.ssid.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("未连接 WiFi")
-            };
-            canvas.text(ssid, 210, 230, 162, 22, 11, 400, app.muted());
-            canvas.rect(28, 344, 364, 176, app.card(), 18);
-            canvas.text("最近动态", 42, 350, 200, 22, 12, 600, app.muted());
-            let fallback = if app.effective.wifi.fallback.ssid.is_empty() {
-                "未设置"
-            } else {
-                &app.effective.wifi.fallback.ssid
-            };
-            canvas.text(
-                &format!("备用：{fallback}"),
-                28,
-                538,
-                274,
-                26,
-                11,
-                400,
-                app.muted(),
-            );
-        }
-        BitBlt(dc, 0, 0, bounds.right, bounds.bottom, memory, 0, 0, SRCCOPY);
-        SelectObject(memory, old);
-        DeleteObject(bitmap);
-        DeleteDC(memory);
-        EndPaint(hwnd, &ps);
+            .into(),
+        );
     }
-}
-unsafe fn draw_button(item: &DRAWITEMSTRUCT, app: &App) {
-    unsafe {
-        FillRect(item.hDC, &item.rcItem, app.background);
-        if [200, 201, 207].contains(&item.CtlID) {
-            draw_toggle(item, app);
+    fn flush_autosave(&mut self, now: Instant) {
+        let Some(revision) = self.autosave.begin(now) else {
             return;
-        }
-        let selected = item.itemState & ODS_SELECTED != 0;
-        let primary = item.CtlID as usize == LOGIN || item.CtlID as usize == SAVE;
-        let color = if primary {
-            if selected { rgb(0, 101, 218) } else { BLUE }
-        } else {
-            if app.dark {
-                rgb(43, 52, 64)
-            } else {
-                rgb(230, 236, 245)
+        };
+        self.save_warning = None;
+        let overrides = match self.form.prepared_overrides(
+            &self.overrides,
+            &self.effective,
+            &self.base,
+            self.system_dark,
+        ) {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                self.finish_save(false, &format!("尚未保存：{error:#}"));
+                return;
             }
         };
-        let dpi = GetDpiForWindow(item.hwndItem).max(96);
-        crate::drawing::rounded_rect(item.hDC, &item.rcItem, scale(8, dpi) as f32, color);
-        let mut text = [0u16; 128];
-        GetWindowTextW(item.hwndItem, text.as_mut_ptr(), 128);
-        let parent = GetParent(item.hwndItem);
-        let font = *app.fonts.get(&(parent as usize)).unwrap_or(&app.font);
-        let old = SelectObject(item.hDC, font);
-        SetBkMode(item.hDC, TRANSPARENT as i32);
-        SetTextColor(
-            item.hDC,
-            if item.itemState & ODS_DISABLED != 0 {
-                app.muted()
-            } else if primary {
-                rgb(255, 255, 255)
-            } else {
-                app.fg()
-            },
-        );
-        let mut rect = item.rcItem;
-        DrawTextW(
-            item.hDC,
-            text.as_ptr(),
-            -1,
-            &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        if item.itemState & ODS_FOCUS != 0 {
-            InflateRect(&mut rect, -scale(4, dpi), -scale(4, dpi));
-            DrawFocusRect(item.hDC, &rect);
-        }
-        SelectObject(item.hDC, old);
-    }
-}
-
-fn choice_values(slot: usize) -> Vec<u64> {
-    match slot {
-        0 => vec![0, 300, 900],
-        1 => vec![15, 30, 60, 120],
-        _ => vec![2, 3, 5],
-    }
-}
-fn choice_label(slot: usize, value: u64) -> String {
-    match slot {
-        0 => {
-            if value == 0 {
-                "不自动切回".into()
-            } else {
-                format!("每 {} 分钟", value / 60)
-            }
-        }
-        1 => format!("{value} 秒"),
-        _ => format!("连续失败 {value} 次"),
-    }
-}
-unsafe fn update_choice(hwnd: HWND, id: i32, slot: usize, app: &App) {
-    unsafe {
-        let values = choice_values(slot);
-        let custom = match slot {
-            0 => app.effective.wifi.fallback.switch_back_interval,
-            1 => app.effective.daemon.probe_interval,
-            _ => app.effective.daemon.failure_threshold as u64,
-        };
-        let label = values
-            .get(app.form_choices[slot])
-            .map(|v| choice_label(slot, *v))
-            .unwrap_or_else(|| format!("沿用配置（{custom}）"));
-        SetWindowTextW(
-            GetDlgItem(hwnd, id),
-            wide(&format!("{label}     ⌄")).as_ptr(),
-        );
-        InvalidateRect(GetDlgItem(hwnd, id), null(), 1);
-    }
-}
-unsafe fn update_toggle(hwnd: HWND, id: i32, slot: usize, app: &App) {
-    unsafe {
-        let label = [
-            "登录 Windows 时启动",
-            "主网不可用时使用备用网络",
-            "启用调试日志",
-        ][slot];
-        SetWindowTextW(
-            GetDlgItem(hwnd, id),
-            wide(&format!(
-                "{label}：{}",
-                if app.form_checks[slot] {
-                    "开启"
-                } else {
-                    "关闭"
-                }
-            ))
-            .as_ptr(),
-        );
-        InvalidateRect(GetDlgItem(hwnd, id), null(), 1);
-    }
-}
-unsafe fn choose_option(hwnd: HWND, id: i32, app: &mut App) {
-    unsafe {
-        let slot = (id - 204) as usize;
-        let values = choice_values(slot);
-        let menu = CreatePopupMenu();
-        for (index, value) in values.iter().enumerate() {
-            AppendMenuW(
-                menu,
-                MF_STRING
-                    | if app.form_choices[slot] == index {
-                        MF_CHECKED
-                    } else {
-                        0
-                    },
-                index + 1,
-                wide(&choice_label(slot, *value)).as_ptr(),
-            );
-        }
-        let mut rect: RECT = zeroed();
-        GetWindowRect(GetDlgItem(hwnd, id), &mut rect);
-        let selected = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            rect.left,
-            rect.bottom,
-            0,
-            hwnd,
-            null(),
-        );
-        DestroyMenu(menu);
-        if selected > 0 {
-            app.form_choices[slot] = selected as usize - 1;
-            update_choice(hwnd, id, slot, app);
-        }
-    }
-}
-unsafe fn draw_toggle(item: &DRAWITEMSTRUCT, app: &App) {
-    unsafe {
-        let slot = if item.CtlID == 200 {
-            0
-        } else if item.CtlID == 201 {
-            1
-        } else {
-            2
-        };
-        let on = app.form_checks[slot];
-        let dpi = GetDpiForWindow(item.hwndItem).max(96);
-        let mut text = [0u16; 128];
-        GetWindowTextW(item.hwndItem, text.as_mut_ptr(), 128);
-        let label = String::from_utf16_lossy(&text)
-            .split('：')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let canvas = Canvas { dc: item.hDC, dpi };
-        canvas.text(&label, 0, 0, 290, 28, 13, 400, app.fg());
-        let x = item.rcItem.right * 96 / dpi as i32 - 40;
-        canvas.rect(
-            x,
-            4,
-            40,
-            20,
-            if on {
-                BLUE
-            } else {
-                if app.dark {
-                    rgb(67, 79, 94)
-                } else {
-                    rgb(191, 201, 214)
-                }
-            },
-            20,
-        );
-        canvas.rect(
-            x + if on { 23 } else { 3 },
-            7,
-            14,
-            14,
-            rgb(255, 255, 255),
-            14,
-        );
-    }
-}
-unsafe fn pick_network(hwnd: HWND, networks: &[String]) {
-    unsafe {
-        if networks.is_empty() {
-            return;
-        }
-        let menu = CreatePopupMenu();
-        for (index, ssid) in networks.iter().take(100).enumerate() {
-            AppendMenuW(menu, MF_STRING, index + 1, wide(ssid).as_ptr());
-        }
-        let mut rect: RECT = zeroed();
-        GetWindowRect(GetDlgItem(hwnd, 202), &mut rect);
-        let selected = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            rect.left,
-            rect.bottom,
-            0,
-            hwnd,
-            null(),
-        );
-        DestroyMenu(menu);
-        if selected > 0
-            && let Some(ssid) = networks.get(selected as usize - 1)
+        let primary_settings = self.form.primary_settings();
+        let primary_patch = primary_settings.patch_against(&self.primary_saved);
+        if !primary_patch.is_empty()
+            && let Err(error) = self.form.validate_primary(&self.effective)
         {
-            SetWindowTextW(GetDlgItem(hwnd, 202), wide(ssid).as_ptr());
+            self.finish_save(false, &format!("主网络尚未保存：{error:#}"));
+            return;
         }
+        if self.preview {
+            self.primary_saved = primary_settings;
+            self.apply_saved_overrides(overrides);
+            if let Some((enabled, generation)) = self.autostart_intent {
+                self.acknowledge_autostart(enabled, generation);
+            }
+            self.finish_save(true, "已自动保留预览设置，未写入文件或修改自启");
+        } else {
+            let command = if primary_patch.is_empty() {
+                Command::Settings(Box::new(overrides.clone()))
+            } else {
+                Command::PrimarySettings(Box::new(primary_patch), self.config_path.clone())
+            };
+            if self.send(command) {
+                self.pending = true;
+                self.saving = Some(PendingSave {
+                    overrides,
+                    primary_settings,
+                    autostart: self.autostart_intent,
+                    revision,
+                });
+                self.feedback = None;
+            } else {
+                self.autosave.finish(false);
+            }
+        }
+    }
+    fn show(&mut self) -> Task<Message> {
+        self.visible = true;
+        window::set_mode(self.window, window::Mode::Windowed).chain(window::gain_focus(self.window))
+    }
+    fn hide(&mut self) -> Task<Message> {
+        if self.tray.is_none() {
+            self.exit_confirm = true;
+            return self.show();
+        }
+        self.visible = false;
+        window::set_mode(self.window, window::Mode::Hidden)
+    }
+    fn tick(&mut self) -> Task<Message> {
+        if let Some(receiver) = &self.shutdown {
+            let outcome = match receiver.try_recv() {
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Empty) => return Task::none(),
+                Err(mpsc::TryRecvError::Disconnected) => shutdown::Outcome {
+                    primary_saved: false,
+                    settings_saved: false,
+                    autostart: None,
+                    error: Some("退出保存线程意外结束；请重试，或明确放弃修改退出".into()),
+                },
+            };
+            return self.finish_shutdown(outcome);
+        }
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(worker) = &self.worker {
+            loop {
+                match worker.events.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                Event::Snapshot(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                }
+                Event::Log(text) => self.log(text),
+                Event::Networks(networks) => {
+                    if networks != self.networks {
+                        self.networks_revision = self.networks_revision.wrapping_add(1);
+                    }
+                    self.networks = networks;
+                    self.feedback = Some(
+                        if self.networks.is_empty() {
+                            "没有发现可用 WiFi"
+                        } else {
+                            "已更新可用 WiFi"
+                        }
+                        .into(),
+                    );
+                }
+                Event::Autostart(enabled) => {
+                    self.autostart_saved(enabled);
+                }
+                Event::SettingsSaved(ok) => self.settings_saved(ok),
+                Event::PrimarySettingsSaved(ok, warning) => {
+                    self.primary_settings_saved(ok, warning)
+                }
+            }
+        }
+        if self
+            .preview_login
+            .is_some_and(|when| Instant::now() >= when)
+        {
+            self.preview_login = None;
+            self.snapshot.status = if self.snapshot.paused {
+                Status::Paused
+            } else {
+                Status::Online
+            };
+            self.snapshot.busy = false;
+            self.snapshot.online = true;
+            self.snapshot.detail = if self.snapshot.paused {
+                "自动探测已暂停，手动连接已完成"
+            } else {
+                "网络连接正常，守护正在后台运行"
+            }
+            .into();
+            self.snapshot.last_login = Some(SystemTime::now());
+            self.log("离线预览：连接状态已更新，未执行网络操作".into());
+        }
+        if self.preview {
+            if self.snapshot.paused {
+                self.snapshot.next_probe = None;
+            } else if !self.snapshot.busy
+                && self
+                    .snapshot
+                    .next_probe
+                    .is_none_or(|next| next <= Instant::now())
+            {
+                self.snapshot.next_probe = Some(
+                    Instant::now() + Duration::from_secs(self.effective.daemon.probe_interval),
+                );
+            }
+        }
+        let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        let mut tasks = Vec::new();
+        for action in actions {
+            tasks.push(match action {
+                tray::Action::Toggle => {
+                    if self.visible {
+                        self.hide()
+                    } else {
+                        self.show()
+                    }
+                }
+                tray::Action::Show => self.show(),
+                tray::Action::Login => self.update(Message::Login),
+                tray::Action::Pause => self.update(Message::TogglePause),
+                tray::Action::Exit => self.update(Message::RequestExit),
+            });
+        }
+        if disconnected {
+            self.worker.take();
+            self.pending = false;
+            self.saving = None;
+            self.autostart_requested = None;
+            self.autosave.finish(false);
+            self.snapshot.status = Status::Stopped;
+            self.snapshot.busy = false;
+            self.snapshot.next_probe = None;
+            self.startup_error = Some("后台守护意外结束，请重新启动应用".into());
+            self.feedback = self.startup_error.clone();
+        }
+        self.flush_autosave(Instant::now());
+        Task::batch(tasks)
+    }
+    fn settings_saved(&mut self, success: bool) {
+        let Some(PendingSave {
+            overrides,
+            autostart,
+            revision,
+            ..
+        }) = self.saving.take()
+        else {
+            return;
+        };
+        if !success {
+            self.finish_save(
+                false,
+                if self.autosave.is_current(revision) {
+                    "自动保存失败，原有设置仍然有效；修改后会再次尝试"
+                } else {
+                    "较早修改保存失败，最新草稿仍在等待自动保存"
+                },
+            );
+            return;
+        }
+        self.apply_saved_overrides(overrides);
+        if let Some((enabled, generation)) = autostart {
+            if enabled == self.snapshot.autostart {
+                self.acknowledge_autostart(enabled, generation);
+                self.finish_save(true, "已自动保存");
+                return;
+            }
+            self.autostart_requested = Some((enabled, generation));
+            if !self.send(Command::Autostart(enabled, self.config_path.clone())) {
+                self.pending = false;
+                self.autostart_requested = None;
+                self.autosave.finish(false);
+            }
+        } else {
+            self.finish_save(true, "已自动保存");
+        }
+    }
+    fn primary_settings_saved(&mut self, success: bool, warning: Option<&'static str>) {
+        let Some(pending) = &self.saving else {
+            return;
+        };
+        if !success {
+            self.saving = None;
+            self.finish_save(false, "主网络设置尚未保存，请查看日志并修正；草稿已保留");
+            return;
+        }
+        // 只更新磁盘基线，不改变运行中 Engine 的认证和 WiFi 配置。
+        self.primary_saved = pending.primary_settings.clone();
+        self.save_warning = warning;
+        let overrides = pending.overrides.clone();
+        if !self.send(Command::Settings(Box::new(overrides))) {
+            self.saving = None;
+            self.finish_save(false, "主网络已保存，界面设置保存失败；请重试");
+        }
+    }
+    fn autostart_saved(&mut self, enabled: bool) {
+        self.snapshot.autostart = enabled;
+        if let Some((desired, generation)) = self.autostart_requested.take() {
+            if desired == enabled {
+                self.acknowledge_autostart(enabled, generation);
+            }
+            self.finish_save(
+                desired == enabled,
+                if desired == enabled {
+                    "已自动保存；自启状态已更新"
+                } else {
+                    "设置已保存，但自启修改失败；请查看日志"
+                },
+            );
+        } else if self.autostart_intent.is_none() {
+            self.form.autostart = enabled;
+        }
+    }
+    fn update(&mut self, message: Message) -> Task<Message> {
+        if self.shutdown.is_some() {
+            return match message {
+                Message::Tick => self.tick(),
+                _ => Task::none(),
+            };
+        }
+        let edited = matches!(
+            message,
+            Message::Autostart(_)
+                | Message::PrimarySsid(_)
+                | Message::Username(_)
+                | Message::AccountPassword(_)
+                | Message::Service(_)
+                | Message::EntryUrl(_)
+                | Message::ApiBase(_)
+                | Message::ProbeUrl(_)
+                | Message::Fallback(_)
+                | Message::Ssid(_)
+                | Message::Password(_)
+                | Message::Recovery(_)
+                | Message::Interval(_)
+                | Message::Threshold(_)
+                | Message::Debug(_)
+                | Message::Mode(_)
+                | Message::Style(_)
+                | Message::Accent(_)
+                | Message::Background(_)
+                | Message::Surface(_)
+                | Message::TextColor(_)
+                | Message::ResetColors
+        );
+        match message {
+            Message::Tick => return self.tick(),
+            Message::Opened(id) => {
+                self.window = id;
+                match tray::Tray::new(self.preview, self.logo_color) {
+                    Ok(tray) => {
+                        tray.set_paused(self.snapshot.paused);
+                        self.tray = Some(tray);
+                    }
+                    Err(_) => {
+                        self.feedback = Some("系统托盘不可用，请保持窗口打开".into());
+                        self.visible = true;
+                    }
+                }
+                if !self.preview {
+                    self.worker = Some(Worker::start_with_paused(
+                        self.base.clone(),
+                        self.overrides.clone(),
+                        self.start_paused,
+                    ));
+                }
+                let tasks = Task::batch([
+                    window::scale_factor(id).map(Message::Scale),
+                    self.refresh_native(),
+                ]);
+                return if self.visible {
+                    Task::batch([self.show(), tasks])
+                } else {
+                    tasks
+                };
+            }
+            Message::CloseRequested(id) if id == self.window => return self.hide(),
+            Message::CloseRequested(_) => {}
+            Message::SystemTheme(mode) => {
+                let dark = mode == iced::theme::Mode::Dark;
+                if self.form.mode == ThemeMode::System && dark != self.system_dark {
+                    let _ = self.form.capture_colors(self.system_dark);
+                    self.system_dark = dark;
+                    self.form.load_colors(dark);
+                } else {
+                    self.system_dark = dark;
+                }
+                return self.refresh_native();
+            }
+            Message::Scale(scale) => {
+                self.icon_scale = scale;
+                if let Ok(logo) = load_logo(scale, self.logo_color) {
+                    self.logo = logo;
+                }
+                return self.refresh_native();
+            }
+            Message::IconsReady => return Task::none(),
+            Message::OpenSettings => {
+                self.page = Page::Settings;
+            }
+            Message::Back => {
+                self.page = Page::Home;
+                self.form.password_visible = false;
+                self.form.account_password_visible = false;
+                let now = Instant::now();
+                self.autosave.expedite(now);
+                self.flush_autosave(now);
+            }
+            Message::Login => {
+                if self.snapshot.busy || self.startup_error.is_some() {
+                    return Task::none();
+                }
+                if self.preview {
+                    self.snapshot.status = Status::Authenticating;
+                    self.snapshot.busy = true;
+                    self.preview_login = Some(Instant::now() + Duration::from_millis(900));
+                } else {
+                    self.send(Command::Login);
+                }
+            }
+            Message::TogglePause => {
+                if self.preview {
+                    self.preview_login = None;
+                    self.snapshot.busy = false;
+                    self.snapshot.paused = !self.snapshot.paused;
+                    self.snapshot.status = if self.snapshot.paused {
+                        Status::Paused
+                    } else {
+                        Status::Online
+                    };
+                    if let Some(tray) = &self.tray {
+                        tray.set_paused(self.snapshot.paused);
+                    }
+                } else {
+                    self.send(Command::Pause(!self.snapshot.paused));
+                }
+            }
+            Message::Autostart(v) => {
+                self.form.autostart = v;
+                self.autostart_generation = self.autostart_generation.wrapping_add(1);
+                self.autostart_intent = Some((v, self.autostart_generation));
+            }
+            Message::Fallback(v) => self.form.fallback_enabled = v,
+            Message::PrimarySsid(v) => self.form.primary_ssid = v,
+            Message::Username(v) => self.form.username = v,
+            Message::AccountPassword(v) => self.form.account_password = v,
+            Message::ToggleAccountPassword => {
+                self.form.account_password_visible = !self.form.account_password_visible
+            }
+            Message::Service(v) => self.form.service = v,
+            Message::EntryUrl(v) => self.form.entry_url = v,
+            Message::ApiBase(v) => self.form.api_base = v,
+            Message::ProbeUrl(v) => self.form.probe_url = v,
+            Message::TogglePortal => self.advanced_portal = !self.advanced_portal,
+            Message::Ssid(v) => self.form.ssid = v,
+            Message::Password(v) => self.form.password = v,
+            Message::TogglePassword => self.form.password_visible = !self.form.password_visible,
+            Message::Recovery(v) => self.form.recovery = v,
+            Message::Interval(v) => self.form.interval = v,
+            Message::Threshold(v) => self.form.threshold = v,
+            Message::Debug(v) => self.form.debug = v,
+            Message::Scan => {
+                if self.preview {
+                    let networks = vec!["Campus_WiFi".into(), "Fallback_WiFi".into()];
+                    if networks != self.networks {
+                        self.networks_revision = self.networks_revision.wrapping_add(1);
+                    }
+                    self.networks = networks;
+                } else {
+                    self.send(Command::ScanNetworks);
+                }
+            }
+            Message::ToggleColors => self.advanced_colors = !self.advanced_colors,
+            Message::Mode(mode) => {
+                if let Err(error) = self.form.capture_colors(self.system_dark) {
+                    self.feedback = Some(error.to_string());
+                    return Task::none();
+                }
+                self.form.mode = mode;
+                self.form.appearance.mode = mode;
+                self.form.load_colors(self.system_dark);
+                self.feedback = None;
+            }
+            Message::Style(style) => {
+                if let Err(error) = self.form.capture_colors(self.system_dark) {
+                    self.feedback = Some(error.to_string());
+                    return Task::none();
+                }
+                self.form.style = style;
+                self.form.appearance.style = style;
+                self.form.load_colors(self.system_dark);
+                self.feedback = None;
+            }
+            Message::Accent(v) => {
+                self.form.accent = v;
+                let _ = self.form.capture_colors(self.system_dark);
+            }
+            Message::Background(v) => {
+                self.form.background = v;
+                let _ = self.form.capture_colors(self.system_dark);
+            }
+            Message::Surface(v) => {
+                self.form.surface = v;
+                let _ = self.form.capture_colors(self.system_dark);
+            }
+            Message::TextColor(v) => {
+                self.form.text = v;
+                let _ = self.form.capture_colors(self.system_dark);
+            }
+            Message::ResetColors => {
+                let dark = appearance::is_dark(&self.form.appearance, self.system_dark);
+                *self.form.appearance.colors_mut(dark) = ColorOverrides::default();
+                self.form.load_colors(self.system_dark);
+                self.feedback = None;
+            }
+            Message::OpenConfig | Message::OpenLog => {
+                if self.preview {
+                    self.feedback = Some("离线预览不打开真实配置或日志".into());
+                } else {
+                    let path = if matches!(message, Message::OpenConfig) {
+                        self.config_path.clone()
+                    } else if self.effective.logging.file.is_empty() {
+                        config::data_dir().join("guardian.log")
+                    } else {
+                        PathBuf::from(&self.effective.logging.file)
+                    };
+                    if platform::open_file(&path).is_err() {
+                        self.feedback =
+                            Some("无法打开文件，请检查文件是否存在及默认打开程序".into());
+                    }
+                }
+            }
+            Message::RequestExit => {
+                self.exit_confirm = true;
+                self.exit_error = None;
+                self.discard_on_exit = false;
+                return self.show();
+            }
+            Message::CancelExit => {
+                self.exit_confirm = false;
+                self.exit_error = None;
+                self.discard_on_exit = false;
+            }
+            Message::ConfirmExit => match self.prepare_exit_plan() {
+                Ok(plan) => self.begin_shutdown(plan),
+                Err(error) => {
+                    let error =
+                        format!("修改尚未保存：{error:#}。请返回设置修正，或明确放弃修改退出");
+                    self.feedback = Some(error.clone());
+                    self.exit_error = Some(error);
+                    self.discard_on_exit = true;
+                    self.exit_confirm = true;
+                    return self.show();
+                }
+            },
+            Message::DiscardAndExit => {
+                if self.discard_on_exit {
+                    self.begin_shutdown(shutdown::Plan {
+                        primary: None,
+                        overrides: None,
+                        autostart: None,
+                    });
+                }
+            }
+        }
+        if edited {
+            self.edited();
+        }
+        self.refresh_native()
+    }
+}
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.join();
+        }
+        if let Some(thread) = self.shutdown_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+// 先按实际 DPI 用面积覆盖的 Lanczos 滤波缩小，避免渲染器直接将大图双线性缩成图标时漏采边缘。
+fn load_logo(scale: f32, accent: [u8; 3]) -> Result<iced::widget::image::Handle> {
+    let pixels = (34.0 * scale).round().clamp(16.0, 256.0) as u32;
+    let mut logo = image::load_from_memory(include_bytes!("../../logo.png"))?
+        .resize_exact(pixels, pixels, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    for pixel in logo.pixels_mut() {
+        pixel.0[..3].copy_from_slice(&accent);
+    }
+    Ok(iced::widget::image::Handle::from_rgba(
+        pixels,
+        pixels,
+        logo.into_raw(),
+    ))
+}
+
+/// 启动 Iced 面板；预览不读取真实配置，暂停启动在后台首次网络周期前生效。
+pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool) -> Result<()> {
+    let Some(guard) = tray::InstanceGuard::acquire(preview)? else {
+        return Ok(());
+    };
+    let (base, overrides, startup_error) = if preview {
+        let mut config = AppConfig::default();
+        config.portal.entry_url = "http://portal.test/".into();
+        config.portal.api_base = "http://portal.test/".into();
+        config.account.username = "2024000000".into();
+        config.account.password = "synthetic-preview-only".into();
+        config.wifi.ssid = "Campus_WiFi".into();
+        (config, GuiOverrides::default(), None)
+    } else {
+        if !config_path.exists() {
+            if let Some(parent) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).context("无法创建配置目录")?;
+            }
+            std::fs::write(&config_path, include_str!("../../config.example.yaml"))
+                .context("无法创建配置模板")?;
+        }
+        match AppConfig::read(&config_path) {
+            Ok(config) => {
+                let error = config.validate().err().map(|error| error.to_string());
+                (config, GuiOverrides::load(), error)
+            }
+            Err(error) => (
+                AppConfig::default(),
+                GuiOverrides::load(),
+                Some(format!("{error}")),
+            ),
+        }
+    };
+    let saved_appearance = overrides
+        .appearance
+        .clone()
+        .filter(|a| appearance::validate(a).is_ok())
+        .unwrap_or_default();
+    let effective = base.effective(&overrides);
+    let cached_theme = appearance::theme(&saved_appearance, false);
+    let primary = cached_theme.palette().primary;
+    let theme_appearance = saved_appearance.clone();
+    let logo_color = [primary.r, primary.g, primary.b].map(|n| (n * 255.0).round() as u8);
+    let mut snapshot = if preview {
+        Snapshot {
+            status: Status::Online,
+            online: true,
+            ssid: "Campus_WiFi".into(),
+            detail: "网络连接正常，守护正在后台运行".into(),
+            last_login: Some(SystemTime::now()),
+            next_probe: Some(Instant::now() + Duration::from_secs(30)),
+            ..Snapshot::default()
+        }
+    } else {
+        Snapshot {
+            status: if startup_error.is_some() {
+                Status::Offline
+            } else {
+                Status::Starting
+            },
+            ..Snapshot::default()
+        }
+    };
+    if start_paused {
+        snapshot.paused = true;
+        snapshot.next_probe = None;
+        if startup_error.is_none() {
+            snapshot.status = Status::Paused;
+            snapshot.detail = "守护已暂停启动，可手动登录或恢复守护".into();
+        }
+    }
+    let icon_image = image::load_from_memory(include_bytes!("../../logo.png"))?.to_rgba8();
+    let icon = window::icon::from_rgba(
+        icon_image.clone().into_raw(),
+        icon_image.width(),
+        icon_image.height(),
+    )
+    .ok();
+    let (id, open) = window::open(window::Settings {
+        size: Size::new(432.0, 560.0),
+        min_size: Some(Size::new(360.0, 480.0)),
+        resizable: true,
+        visible: !hidden,
+        exit_on_close_request: false,
+        icon,
+        ..window::Settings::default()
+    });
+    let app = App {
+        page: Page::Home,
+        form: Form::new(&effective, saved_appearance.clone(), false, false),
+        snapshot,
+        startup_error,
+        logs: VecDeque::new(),
+        effective,
+        networks: Vec::new(),
+        networks_revision: 0,
+        pending: false,
+        feedback: None,
+        preview,
+        start_paused,
+        exit_confirm: false,
+        exit_error: None,
+        discard_on_exit: false,
+        logo: load_logo(1.0, logo_color)?,
+        advanced_colors: false,
+        advanced_portal: false,
+        primary_saved: PrimarySettings::from_config(&base),
+        base,
+        overrides,
+        system_dark: false,
+        worker: None,
+        tray: None,
+        _guard: guard,
+        window: id,
+        visible: !hidden,
+        config_path,
+        saving: None,
+        save_warning: None,
+        autostart_requested: None,
+        autostart_intent: None,
+        autostart_generation: 0,
+        autosave: Autosave::default(),
+        shutdown: None,
+        exit_plan: None,
+        shutdown_thread: None,
+        preview_login: None,
+        icon_scale: 1.0,
+        logo_color,
+        cached_theme,
+        theme_appearance,
+        theme_dark: false,
+    };
+    let boot = RefCell::new(Some((
+        app,
+        Task::batch([
+            open.map(Message::Opened),
+            iced::system::theme().map(Message::SystemTheme),
+        ]),
+    )));
+    iced::daemon(
+        move || boot.borrow_mut().take().expect("Iced 初始化只能执行一次"),
+        App::update,
+        App::view,
+    )
+    .title(if preview {
+        "CUIT Helper · 离线预览"
+    } else {
+        "CUIT Helper"
+    })
+    .theme(App::theme)
+    .subscription(App::subscription)
+    .default_font(Font::with_name("Microsoft YaHei UI"))
+    .antialiasing(true)
+    .run()
+    .map_err(|_| anyhow::anyhow!("桌面界面初始化失败，请检查显示环境"))
+}
+/// 在尚未建立 Iced 事件循环时呈现启动错误。
+pub fn show_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "CUIT Helper".encode_utf16().chain(Some(0)).collect();
+    // UTF-16 缓冲区以 NUL 结尾，并在同步调用期间保持有效。
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn icon_contains_native_dpi_resources() {
-        let bytes = include_bytes!("../../assets/app.ico");
-        assert_eq!(&bytes[..4], &[0, 0, 1, 0]);
-        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        let sizes: Vec<_> = (0..count)
-            .map(|i| {
-                let s = bytes[6 + i * 16];
-                if s == 0 { 256 } else { s as u32 }
-            })
-            .collect();
-        for size in [16, 20, 24, 28, 32, 40, 48, 64, 128, 256] {
-            assert!(sizes.contains(&size));
+
+    // 不启动 Iced、不创建窗口或托盘、不启动 Worker；所有 Task 都只构造而不运行。
+    fn offline_app() -> App {
+        let base = AppConfig::default();
+        let appearance = Appearance::default();
+        let cached_theme = appearance::theme(&appearance, false);
+        App {
+            page: Page::Settings,
+            snapshot: Snapshot::default(),
+            startup_error: Some("合成测试配置".into()),
+            logs: VecDeque::new(),
+            effective: base.clone(),
+            form: Form::new(&base, appearance.clone(), false, false),
+            networks: Vec::new(),
+            networks_revision: 0,
+            pending: false,
+            feedback: None,
+            preview: true,
+            start_paused: false,
+            exit_confirm: false,
+            exit_error: None,
+            discard_on_exit: false,
+            logo: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]),
+            advanced_colors: false,
+            advanced_portal: false,
+            primary_saved: PrimarySettings::from_config(&base),
+            base,
+            overrides: GuiOverrides::default(),
+            system_dark: false,
+            worker: None,
+            tray: None,
+            _guard: tray::InstanceGuard::acquire(true).unwrap().unwrap(),
+            window: window::Id::unique(),
+            visible: true,
+            config_path: PathBuf::from("synthetic-unused.yaml"),
+            saving: None,
+            save_warning: None,
+            autostart_requested: None,
+            autostart_intent: None,
+            autostart_generation: 0,
+            autosave: Autosave::default(),
+            shutdown: None,
+            exit_plan: None,
+            shutdown_thread: None,
+            preview_login: None,
+            icon_scale: 1.0,
+            logo_color: [0, 0, 0],
+            cached_theme,
+            theme_appearance: appearance,
+            theme_dark: false,
         }
     }
+
+    fn stage_save(app: &mut App) {
+        let revision = app
+            .autosave
+            .begin(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let overrides = app
+            .form
+            .prepared_overrides(&app.overrides, &app.effective, &app.base, false)
+            .unwrap();
+        app.pending = true;
+        app.saving = Some(PendingSave {
+            overrides,
+            primary_settings: app.form.primary_settings(),
+            autostart: app.autostart_intent,
+            revision,
+        });
+    }
+
+    fn valid_primary_app() -> App {
+        let mut app = offline_app();
+        app.base.portal.entry_url = "https://portal.test/entry".into();
+        app.base.portal.api_base = "https://portal.test/api".into();
+        app.base.portal.probe_url = "https://probe.test/check".into();
+        app.base.account.username = "synthetic-student".into();
+        app.base.account.password = "synthetic-password".into();
+        app.base.wifi.ssid = "Synthetic_Campus".into();
+        app.effective = app.base.clone();
+        app.primary_saved = PrimarySettings::from_config(&app.base);
+        app.form = Form::new(&app.base, Appearance::default(), false, false);
+        app
+    }
+
     #[test]
-    fn windows_loads_exact_size_from_embedded_icon() {
-        unsafe {
-            for size in [16, 20, 24, 32, 40, 48] {
-                let icon = LoadImageW(
-                    GetModuleHandleW(null()),
-                    icon_resource(),
-                    IMAGE_ICON,
-                    size,
-                    size,
-                    0,
-                ) as HICON;
-                assert!(!icon.is_null(), "missing embedded icon");
-                let mut info: ICONINFO = zeroed();
-                assert_ne!(GetIconInfo(icon, &mut info), 0);
-                let mut bitmap: BITMAP = zeroed();
-                GetObjectW(
-                    info.hbmColor,
-                    size_of::<BITMAP>() as i32,
-                    (&mut bitmap as *mut BITMAP).cast(),
-                );
-                assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (size, size));
-                DeleteObject(info.hbmColor);
-                DeleteObject(info.hbmMask);
-                DestroyIcon(icon);
-            }
+    fn preview_primary_save_only_changes_memory_and_keeps_runtime_network() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::PrimarySsid("New_Synthetic_Campus".into()));
+        let _ = app.update(Message::AccountPassword("new-synthetic-password".into()));
+        app.flush_autosave(Instant::now() + Duration::from_secs(2));
+        assert_eq!(app.primary_saved.ssid, "New_Synthetic_Campus");
+        assert_eq!(app.primary_saved.password, "new-synthetic-password");
+        assert_eq!(app.effective.wifi.ssid, "Synthetic_Campus");
+        assert_eq!(app.base.account.password, "synthetic-password");
+        let json = serde_json::to_string(&app.overrides).unwrap();
+        assert!(!json.contains("New_Synthetic_Campus"));
+        assert!(!json.contains("new-synthetic-password"));
+        assert!(!app.autosave.is_dirty());
+        assert!(app.worker.is_none());
+    }
+
+    #[test]
+    fn appearance_edit_preserves_spaced_ssid_and_invalid_unedited_service() {
+        let mut base = AppConfig::default();
+        base.wifi.ssid = " Synthetic_Campus ".into();
+        base.portal.service = "synthetic-unknown".into();
+        let previous = PrimarySettings::from_config(&base);
+        let mut form = Form::new(&base, Appearance::default(), false, false);
+        form.style = ThemeStyle::ChatGpt;
+        assert!(form.primary_settings().patch_against(&previous).is_empty());
+        form.service = ServiceChoice::Telecom;
+        let patch = form.primary_settings().patch_against(&previous);
+        assert_eq!(patch.service.as_deref(), Some("ctcc"));
+        assert!(patch.ssid.is_none());
+    }
+
+    #[test]
+    fn exit_reverted_primary_field_overwrites_in_flight_older_value() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::PrimarySsid("Older_Synthetic_Campus".into()));
+        stage_save(&mut app);
+        let _ = app.update(Message::PrimarySsid("Synthetic_Campus".into()));
+        let plan = app.prepare_exit_plan().unwrap();
+        let (patch, final_settings) = plan.primary.unwrap();
+        assert_eq!(patch.ssid.as_deref(), Some("Synthetic_Campus"));
+        assert_eq!(final_settings.ssid, "Synthetic_Campus");
+        assert!(patch.password.is_none());
+    }
+
+    #[test]
+    fn primary_ack_preserves_newer_input_and_does_not_apply_network() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::Username("first-synthetic-student".into()));
+        stage_save(&mut app);
+        let _ = app.update(Message::Username("latest-synthetic-student".into()));
+        app.primary_settings_saved(true, None);
+        assert_eq!(app.primary_saved.username, "first-synthetic-student");
+        assert_eq!(app.form.username, "latest-synthetic-student");
+        assert_eq!(app.effective.account.username, "synthetic-student");
+        assert!(app.autosave.is_dirty());
+    }
+
+    #[test]
+    fn committed_primary_cleanup_warning_advances_baseline_and_keeps_revert() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::PrimarySsid("New_Synthetic_Campus".into()));
+        stage_save(&mut app);
+        app.primary_settings_saved(true, Some("主网络已保存，私有旧配置清理失败"));
+        assert_eq!(app.primary_saved.ssid, "New_Synthetic_Campus");
+        let _ = app.update(Message::PrimarySsid("Synthetic_Campus".into()));
+        let plan = app.prepare_exit_plan().unwrap();
+        assert_eq!(
+            plan.primary.unwrap().0.ssid.as_deref(),
+            Some("Synthetic_Campus")
+        );
+    }
+
+    #[test]
+    fn invalid_primary_draft_is_kept_and_blocks_exit_persistence() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::EntryUrl("invalid-synthetic-url".into()));
+        app.flush_autosave(Instant::now() + Duration::from_secs(2));
+        assert_eq!(app.form.entry_url, "invalid-synthetic-url");
+        assert_eq!(app.primary_saved.entry_url, "https://portal.test/entry");
+        assert!(app.feedback.as_deref().unwrap().contains("尚未保存"));
+        assert!(app.prepare_exit_plan().is_err());
+    }
+
+    #[test]
+    fn theme_edit_before_first_snapshot_never_changes_existing_autostart() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Style(ThemeStyle::ChatGpt));
+        assert!(app.autosave.is_dirty());
+        app.apply_snapshot(Snapshot {
+            autostart: true,
+            ..Snapshot::default()
+        });
+        assert!(app.form.autostart);
+        assert!(app.autostart_intent.is_none());
+        stage_save(&mut app);
+        assert!(app.saving.as_ref().unwrap().autostart.is_none());
+        app.settings_saved(true);
+        assert!(app.autostart_requested.is_none());
+        assert!(app.form.autostart);
+    }
+
+    #[test]
+    fn autostart_ack_uses_its_own_generation_after_unrelated_edits() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Autostart(true));
+        stage_save(&mut app);
+        app.autostart_requested = app.autostart_intent;
+        let _ = app.update(Message::Ssid("Later_Synthetic_WiFi".into()));
+        app.autostart_saved(true);
+        assert!(app.form.autostart);
+        assert!(app.autostart_intent.is_none());
+        assert!(app.autosave.is_dirty());
+    }
+
+    #[test]
+    fn exit_captures_latest_valid_draft_before_debounce_or_after_failure() {
+        let mut app = offline_app();
+        let before_edit = Instant::now();
+        let _ = app.update(Message::Ssid("Latest_Synthetic_WiFi".into()));
+        assert!(app.autosave.begin(before_edit).is_none());
+        let plan = app.prepare_exit_plan().unwrap();
+        assert_eq!(
+            plan.overrides.unwrap().fallback_ssid.as_deref(),
+            Some("Latest_Synthetic_WiFi")
+        );
+        stage_save(&mut app);
+        app.settings_saved(false);
+        assert!(
+            app.autosave
+                .begin(Instant::now() + Duration::from_secs(10))
+                .is_none()
+        );
+        let plan = app.prepare_exit_plan().unwrap();
+        assert_eq!(
+            plan.overrides.unwrap().fallback_ssid.as_deref(),
+            Some("Latest_Synthetic_WiFi")
+        );
+        assert!(plan.autostart.is_none());
+    }
+
+    #[test]
+    fn exit_snapshot_supersedes_an_older_in_flight_save() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Ssid("Older_Synthetic_WiFi".into()));
+        stage_save(&mut app);
+        let _ = app.update(Message::Ssid("Latest_Synthetic_WiFi".into()));
+        let plan = app.prepare_exit_plan().unwrap();
+        let stored = RefCell::new(String::new());
+        let result = shutdown::run_with(
+            &plan,
+            false,
+            || {
+                *stored.borrow_mut() = "Older_Synthetic_WiFi".into();
+            },
+            |_| panic!("仅修改备用网络不得写主网络"),
+            |overrides| {
+                *stored.borrow_mut() = overrides.fallback_ssid.clone().unwrap();
+                Ok(())
+            },
+            |_| panic!("仅修改网络草稿不得操作自启"),
+        );
+        assert_eq!(*stored.borrow(), "Latest_Synthetic_WiFi");
+        app.exit_plan = Some(plan);
+        let _ = app.finish_shutdown(result);
+        assert_eq!(app.effective.wifi.fallback.ssid, "Latest_Synthetic_WiFi");
+        assert!(!app.pending);
+        assert!(app.saving.is_none());
+    }
+
+    #[test]
+    fn shutdown_save_failure_keeps_a_visible_retry_or_discard_path() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Ssid("Unsaved_Synthetic_WiFi".into()));
+        app.exit_plan = Some(app.prepare_exit_plan().unwrap());
+        let _ = app.finish_shutdown(shutdown::Outcome {
+            primary_saved: false,
+            settings_saved: false,
+            autostart: None,
+            error: Some("合成保存失败".into()),
+        });
+        assert!(app.shutdown.is_none());
+        assert!(app.exit_confirm && app.discard_on_exit);
+        assert_eq!(app.exit_error.as_deref(), Some("合成保存失败"));
+        assert_eq!(app.form.ssid, "Unsaved_Synthetic_WiFi");
+        assert_eq!(app.overrides.fallback_ssid, None);
+        assert!(app.prepare_exit_plan().unwrap().overrides.is_some());
+    }
+
+    #[test]
+    fn invalid_exit_draft_requires_explicit_discard_without_stopping_worker() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Accent("#03".into()));
+        let _ = app.update(Message::ConfirmExit);
+        assert!(app.shutdown.is_none());
+        assert!(app.exit_confirm && app.discard_on_exit);
+        assert!(app.exit_error.as_deref().unwrap().contains("尚未保存"));
+        assert_eq!(app.form.accent, "#03");
+    }
+
+    #[test]
+    fn older_save_ack_updates_baseline_without_replacing_newer_draft() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Ssid("First_Synthetic_WiFi".into()));
+        stage_save(&mut app);
+        let _ = app.update(Message::Ssid("Latest_Synthetic_WiFi".into()));
+        app.settings_saved(true);
+        assert_eq!(app.effective.wifi.fallback.ssid, "First_Synthetic_WiFi");
+        assert_eq!(app.form.ssid, "Latest_Synthetic_WiFi");
+        assert!(app.autosave.is_dirty());
+        app.flush_autosave(Instant::now() + Duration::from_secs(2));
+        assert_eq!(app.effective.wifi.fallback.ssid, "Latest_Synthetic_WiFi");
+        assert!(!app.autosave.is_dirty());
+        assert!(app.worker.is_none());
+    }
+
+    #[test]
+    fn autostart_ack_does_not_replace_newer_user_selection() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Autostart(true));
+        let revision = app
+            .autosave
+            .begin(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        app.autostart_requested = Some((true, revision));
+        app.pending = true;
+        let _ = app.update(Message::Autostart(false));
+        app.autostart_saved(true);
+        assert!(app.snapshot.autostart);
+        assert!(!app.form.autostart);
+        assert!(app.autosave.is_dirty());
+        app.flush_autosave(Instant::now() + Duration::from_secs(2));
+        assert!(!app.snapshot.autostart);
+        assert!(!app.autosave.is_dirty());
+    }
+
+    #[test]
+    fn failed_save_preserves_draft_and_navigation_does_not_retry_it() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Ssid("Unsaved_Synthetic_WiFi".into()));
+        stage_save(&mut app);
+        app.settings_saved(false);
+        let _ = app.update(Message::Back);
+        let _ = app.update(Message::OpenSettings);
+        assert_eq!(app.form.ssid, "Unsaved_Synthetic_WiFi");
+        assert_eq!(app.effective.wifi.fallback.ssid, "");
+        assert!(app.autosave.is_dirty());
+        assert!(app.feedback.as_deref().unwrap().contains("失败"));
+        assert_eq!(
+            app.autosave.begin(Instant::now() + Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_drafts_survive_navigation_and_never_replace_saved_overrides() {
+        let mut app = offline_app();
+        let previous = serde_json::to_value(&app.overrides).unwrap();
+        let _ = app.update(Message::Accent("#03".into()));
+        let _ = app.update(Message::Back);
+        let _ = app.update(Message::OpenSettings);
+        assert_eq!(app.form.accent, "#03");
+        assert_eq!(serde_json::to_value(&app.overrides).unwrap(), previous);
+        assert!(app.feedback.as_deref().unwrap().contains("尚未保存"));
+        for ssid in ["", "contains\0nul", "synthetic-network-name-over-32-bytes"] {
+            let mut form = Form::new(&app.base, Appearance::default(), false, false);
+            form.fallback_enabled = true;
+            form.ssid = ssid.into();
+            assert!(
+                form.prepared_overrides(&app.overrides, &app.effective, &app.base, false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn saved_settings_restore_form_without_creating_a_dirty_draft() {
+        let base = AppConfig::default();
+        let mut appearance = Appearance {
+            style: ThemeStyle::ChatGpt,
+            mode: ThemeMode::Dark,
+            ..Default::default()
+        };
+        appearance.colors_mut(true).accent_color = Some("#E0AA88".into());
+        let overrides = GuiOverrides {
+            probe_interval: Some(60),
+            failure_threshold: Some(5),
+            fallback_ssid: Some("Saved_Synthetic_WiFi".into()),
+            appearance: Some(appearance.clone()),
+            ..Default::default()
+        };
+        let restored: GuiOverrides =
+            serde_json::from_value(serde_json::to_value(overrides).unwrap()).unwrap();
+        let form = Form::new(
+            &base.effective(&restored),
+            restored.appearance.unwrap(),
+            true,
+            false,
+        );
+        assert_eq!(form.ssid, "Saved_Synthetic_WiFi");
+        assert_eq!(form.interval.0, 60);
+        assert_eq!(form.threshold.0, 5);
+        assert!(form.autostart);
+        assert_eq!(form.appearance, appearance);
+        assert_eq!(form.accent, "#E0AA88");
+        assert!(!Autosave::default().is_dirty());
+    }
+
+    #[test]
+    fn preserves_yaml_only_values_when_saving_appearance() {
+        let mut config = AppConfig::default();
+        config.daemon.probe_interval = 47;
+        config.daemon.failure_threshold = 7;
+        config.wifi.fallback.switch_back_interval = 731;
+        config.logging.level = "WARNING".into();
+        let form = Form::new(&config, Appearance::default(), false, false);
+        let overrides = form.overrides(&GuiOverrides::default(), &config);
+        let actual = config.effective(&overrides);
+        assert_eq!(actual.daemon.probe_interval, 47);
+        assert_eq!(actual.daemon.failure_threshold, 7);
+        assert_eq!(actual.wifi.fallback.switch_back_interval, 731);
+        assert_eq!(actual.logging.level, "WARNING");
+    }
+    #[test]
+    fn incomplete_hex_does_not_replace_valid_preview() {
+        let mut form = Form::new(&AppConfig::default(), Appearance::default(), false, false);
+        let old = form.appearance.clone();
+        form.accent = "#03".into();
+        assert!(form.capture_colors(false).is_err());
+        assert_eq!(form.appearance, old);
+    }
+    #[test]
+    fn unreadable_intermediate_colors_keep_the_last_readable_preview() {
+        let mut app = offline_app();
+        let previous = app.cached_theme.palette();
+        let _ = app.update(Message::Background("#141413".into()));
+        assert_eq!(app.cached_theme.palette().background, previous.background);
+        app.flush_autosave(Instant::now() + Duration::from_secs(2));
+        assert!(app.feedback.as_deref().unwrap().contains("尚未保存"));
+        let _ = app.update(Message::TextColor("#FAF9F5".into()));
+        let _ = app.update(Message::Surface("#212121".into()));
+        let palette = app.cached_theme.palette();
+        assert!(palette.text.relative_contrast(palette.background) >= 4.5);
+        assert_eq!(palette.background, iced::Color::from_rgb8(20, 20, 19));
+    }
+    #[test]
+    fn debug_messages_redact_sensitive_inputs() {
+        assert!(!format!("{:?}", Message::Password("test-secret".into())).contains("test-secret"));
+        assert!(!format!("{:?}", Message::Ssid("test-network".into())).contains("test-network"));
+        for message in [
+            Message::PrimarySsid("private-synthetic".into()),
+            Message::Username("private-synthetic".into()),
+            Message::AccountPassword("private-synthetic".into()),
+            Message::EntryUrl("private-synthetic".into()),
+            Message::ApiBase("private-synthetic".into()),
+            Message::ProbeUrl("private-synthetic".into()),
+        ] {
+            assert!(!format!("{message:?}").contains("private-synthetic"));
         }
     }
 }

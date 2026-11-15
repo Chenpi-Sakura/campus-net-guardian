@@ -26,6 +26,7 @@ struct Options {
     config: Option<PathBuf>,
     benchmark: bool,
     hidden: bool,
+    paused: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
@@ -49,7 +50,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
                 result.hidden = true;
                 continue;
             }
-            "--benchmark-ui" => {
+            "--paused" => {
+                result.paused = true;
+                continue;
+            }
+            "--preview" | "--benchmark-ui" => {
                 result.benchmark = true;
                 Mode::Gui
             }
@@ -66,7 +71,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--autostart-status" => Mode::AutostartStatus,
             "--version" | "-V" => Mode::Version,
             "--help" | "-h" => Mode::Help,
-            _ => bail!("不支持此启动参数，请使用 --help 查看 Rust 版可用命令"),
+            _ => bail!("不支持此启动参数，请使用 --help 查看可用命令"),
         };
         if mode_set {
             bail!("一次只能指定一种运行模式");
@@ -74,11 +79,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
         mode_set = true;
         result.mode = mode;
     }
-    if result.mode != Mode::Gui && (result.hidden || result.benchmark) {
-        bail!("隐藏或性能测量参数只适用于桌面模式");
+    if result.mode != Mode::Gui && (result.hidden || result.benchmark || result.paused) {
+        bail!("隐藏、暂停启动或离线预览参数只适用于桌面模式");
     }
     if result.benchmark && result.config.is_some() {
-        bail!("性能测量模式不接受真实配置文件");
+        bail!("离线预览模式不接受真实配置文件");
     }
     Ok(result)
 }
@@ -94,12 +99,12 @@ fn main() {
 fn run() -> Result<()> {
     let options = parse(std::env::args().skip(1))?;
     if options.mode == Mode::Version {
-        println!("campus-guardian {}", env!("CARGO_PKG_VERSION"));
+        println!("CUIT Helper {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if options.mode == Mode::Help {
         println!(
-            "校园网守护\n--gui [--hidden]  桌面守护\n--config <路径>  指定配置\n--once          登录一次\n--probe         探测连接\n--check         校验配置\n--enable-autostart / --disable-autostart / --autostart-status\n--version"
+            "CUIT Helper\n--gui [--hidden] [--paused]  桌面守护，可暂停启动\n--preview       离线界面预览，不改变网络\n--config <路径>  指定配置\n--once          登录一次\n--probe         探测连接\n--check         校验配置\n--enable-autostart / --disable-autostart / --autostart-status\n--version"
         );
         return Ok(());
     }
@@ -125,7 +130,7 @@ fn run() -> Result<()> {
     }
     if options.mode == Mode::Gui {
         #[cfg(windows)]
-        return campus_guardian::ui::run(path, options.benchmark, options.hidden);
+        return campus_guardian::ui::run(path, options.benchmark, options.hidden, options.paused);
         #[cfg(not(windows))]
         bail!("桌面应用仅支持 Windows");
     }
@@ -179,11 +184,34 @@ mod tests {
     #[test]
     fn benchmark_never_accepts_local_config() {
         assert!(parse(args(&["--benchmark-ui", "--config", "config.yaml"])).is_err());
+        assert!(parse(args(&["--preview", "--config", "config.yaml"])).is_err());
+        assert!(parse(args(&["--preview"])).unwrap().benchmark);
     }
     #[test]
     fn supports_hidden_startup() {
         let result = parse(args(&["--gui", "--hidden"])).unwrap();
         assert!(result.hidden);
         assert_eq!(result.mode, Mode::Gui);
+    }
+    #[test]
+    fn paused_startup_is_gui_only_and_not_the_default() {
+        let result = parse(args(&["--gui", "--paused"])).unwrap();
+        assert!(result.paused);
+        assert_eq!(result.mode, Mode::Gui);
+        assert!(parse(args(&["--paused"])).unwrap().paused);
+        assert!(!parse(args(&["--gui", "--hidden"])).unwrap().paused);
+        for mode in [
+            "--once",
+            "--probe",
+            "--check",
+            "--enable-autostart",
+            "--disable-autostart",
+            "--autostart-status",
+            "--version",
+            "--help",
+        ] {
+            assert!(parse(args(&[mode, "--paused"])).is_err());
+            assert!(parse(args(&["--paused", mode])).is_err());
+        }
     }
 }
