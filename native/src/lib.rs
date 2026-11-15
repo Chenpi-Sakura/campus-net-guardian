@@ -5,6 +5,3 @@ pub mod daemon;
 pub mod platform;
 #[cfg(windows)]
 pub mod ui;
-
-#[cfg(windows)]
-pub mod drawing;

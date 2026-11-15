@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{AuthClient, AuthResult},
-    config::{AppConfig, GuiOverrides},
+    config::{AppConfig, GuiOverrides, PrimaryPatch},
     platform,
 };
 use anyhow::Result;
@@ -52,7 +52,8 @@ pub struct Snapshot {
 pub enum Command {
     Login,
     Pause(bool),
-    Settings(GuiOverrides),
+    Settings(Box<GuiOverrides>),
+    PrimarySettings(Box<PrimaryPatch>, std::path::PathBuf),
     Autostart(bool, std::path::PathBuf),
     ScanNetworks,
     Stop,
@@ -63,6 +64,7 @@ pub enum Event {
     Autostart(bool),
     Networks(Vec<String>),
     SettingsSaved(bool),
+    PrimarySettingsSaved(bool, Option<&'static str>),
 }
 
 pub struct Worker {
@@ -207,32 +209,28 @@ fn run(
                     emit(Event::SettingsSaved(false));
                     continue;
                 }
-                let fallback_changed =
-                    engine.config.wifi.fallback.ssid != effective.wifi.fallback.ssid;
-                engine.config = effective;
+                valid = engine.apply_saved_config(effective, Instant::now());
                 *log_config.borrow_mut() = engine.config.logging.clone();
-                valid = engine.config.validate().is_ok();
-                if engine.mode == NetworkMode::Fallback
-                    && (!engine.config.wifi.fallback.enabled || fallback_changed)
-                {
-                    engine.mode = if engine.config.wifi.fallback.enabled {
-                        NetworkMode::Fallback
-                    } else {
-                        NetworkMode::Primary
-                    };
-                    engine.snapshot.online = false;
-                    engine.auth_required = true;
-                    engine.fallback_failures = 0;
-                }
-                engine.next = Instant::now();
-                engine.snapshot.next_probe = if valid && !engine.snapshot.paused {
-                    Some(engine.next)
-                } else {
-                    None
-                };
                 emit(Event::Log("设置已保存并生效".into()));
                 emit(Event::SettingsSaved(true));
                 emit(Event::Snapshot(engine.snapshot.clone()));
+            }
+            Ok(Command::PrimarySettings(patch, path)) => {
+                // 只持久化 YAML；当前 Engine 的配置、会话和探测时间均保持原值。
+                let result = patch.save_to(&path);
+                match result {
+                    Ok(outcome) => {
+                        emit(Event::Log("主网络设置已保存，重启后生效".into()));
+                        if let Some(warning) = outcome.warning {
+                            emit(Event::Log(format!("主网络设置清理失败：{warning}")));
+                        }
+                        emit(Event::PrimarySettingsSaved(true, outcome.warning));
+                    }
+                    Err(error) => {
+                        emit(Event::Log(format!("主网络设置保存失败：{error:#}")));
+                        emit(Event::PrimarySettingsSaved(false, None));
+                    }
+                }
             }
             Ok(Command::Autostart(enabled, config_path)) => {
                 match platform::set_autostart_with_config(enabled, &config_path) {
@@ -285,6 +283,17 @@ fn settings_valid(s: &GuiOverrides) -> bool {
             .as_ref()
             .is_none_or(|v| matches!(v.as_str(), "INFO" | "DEBUG"))
         && s.fallback_ssid.as_ref().is_none_or(|v| v.len() <= 32)
+        && s.appearance.as_ref().is_none_or(|v| v.validate().is_ok())
+}
+
+fn network_settings_changed(before: &AppConfig, after: &AppConfig) -> bool {
+    // 只比较 GUI 可覆盖的实际网络值，覆盖项是否显式填写不影响判断。
+    before.daemon.probe_interval != after.daemon.probe_interval
+        || before.daemon.failure_threshold != after.daemon.failure_threshold
+        || before.wifi.fallback.enabled != after.wifi.fallback.enabled
+        || before.wifi.fallback.ssid != after.wifi.fallback.ssid
+        || before.wifi.fallback.password != after.wifi.fallback.password
+        || before.wifi.fallback.switch_back_interval != after.wifi.fallback.switch_back_interval
 }
 
 fn write_log(cfg: &crate::config::LoggingConfig, message: &str) -> Result<()> {
@@ -430,6 +439,36 @@ impl Engine {
             last_recovery: now,
         }
     }
+
+    fn apply_saved_config(&mut self, config: AppConfig, now: Instant) -> bool {
+        let network_changed = network_settings_changed(&self.config, &config);
+        let fallback_changed = self.config.wifi.fallback.ssid != config.wifi.fallback.ssid;
+        self.config = config;
+        let valid = self.config.validate().is_ok();
+        // 外观和日志修改不提前探测，不重置仍在退避中的网络状态。
+        if network_changed {
+            if self.mode == NetworkMode::Fallback
+                && (!self.config.wifi.fallback.enabled || fallback_changed)
+            {
+                self.mode = if self.config.wifi.fallback.enabled {
+                    NetworkMode::Fallback
+                } else {
+                    NetworkMode::Primary
+                };
+                self.snapshot.online = false;
+                self.auth_required = true;
+                self.fallback_failures = 0;
+            }
+            self.next = now;
+            self.snapshot.next_probe = if valid && !self.snapshot.paused {
+                Some(self.next)
+            } else {
+                None
+            };
+        }
+        valid
+    }
+
     fn cycle(&mut self, backend: &mut impl Backend, emit: &mut impl FnMut(Event), now: Instant) {
         let started = Instant::now();
         self.snapshot.busy = true;
@@ -689,6 +728,151 @@ mod tests {
         cfg.wifi.fallback.enabled = true;
         cfg.wifi.fallback.ssid = "Fallback_WiFi".into();
         Engine::new(cfg, GuiOverrides::default(), now)
+    }
+    fn configured_engine(now: Instant) -> Engine {
+        let mut cfg = AppConfig::default();
+        cfg.portal.entry_url = "https://portal.test/entry".into();
+        cfg.portal.api_base = "https://portal.test/api".into();
+        cfg.account.username = "synthetic-user".into();
+        cfg.account.password = "synthetic-password".into();
+        cfg.wifi.fallback.enabled = true;
+        cfg.wifi.fallback.ssid = "Fallback_WiFi".into();
+        Engine::new(cfg, GuiOverrides::default(), now)
+    }
+    #[test]
+    fn appearance_and_logging_changes_preserve_network_schedule_and_counters() {
+        for (mode, paused, fallback_enabled) in [
+            (NetworkMode::Primary, false, true),
+            (NetworkMode::Fallback, false, true),
+            (NetworkMode::Fallback, false, false),
+            (NetworkMode::Offline, false, true),
+            (NetworkMode::Primary, true, true),
+        ] {
+            for change in 0..3 {
+                let now = Instant::now();
+                let mut e = configured_engine(now);
+                e.base.wifi.fallback.enabled = fallback_enabled;
+                e.config.wifi.fallback.enabled = fallback_enabled;
+                e.mode = mode;
+                e.next = now + Duration::from_secs(180);
+                e.snapshot.next_probe = (!paused).then_some(e.next);
+                e.snapshot.paused = paused;
+                e.snapshot.online = mode != NetworkMode::Offline;
+                e.auth_required = false;
+                e.primary_failures = 4;
+                e.probe_failures = 2;
+                e.fallback_failures = 3;
+                let next = e.next;
+                let next_probe = e.snapshot.next_probe;
+                let online = e.snapshot.online;
+                // 显式填写相同网络值不应被误判为需要重新连接。
+                let settings = GuiOverrides {
+                    probe_interval: Some(e.config.daemon.probe_interval),
+                    failure_threshold: Some(e.config.daemon.failure_threshold),
+                    appearance: (change != 1).then(crate::config::Appearance::default),
+                    log_level: (change != 0).then(|| "DEBUG".into()),
+                    ..Default::default()
+                };
+                assert!(
+                    e.apply_saved_config(e.base.effective(&settings), now + Duration::from_secs(1))
+                );
+                assert_eq!(e.next, next);
+                assert_eq!(e.snapshot.next_probe, next_probe);
+                assert_eq!(e.primary_failures, 4);
+                assert_eq!(e.probe_failures, 2);
+                assert_eq!(e.fallback_failures, 3);
+                assert_eq!(e.mode, mode);
+                assert_eq!(e.snapshot.online, online);
+                assert_eq!(e.snapshot.paused, paused);
+                assert!(!e.auth_required);
+                assert_eq!(e.last_recovery, now);
+                assert_eq!(
+                    e.config.logging.level,
+                    if change == 0 { "INFO" } else { "DEBUG" }
+                );
+            }
+        }
+    }
+    #[test]
+    fn changed_effective_network_values_reschedule_without_resetting_failures() {
+        for settings in [
+            GuiOverrides {
+                probe_interval: Some(60),
+                ..Default::default()
+            },
+            GuiOverrides {
+                failure_threshold: Some(5),
+                ..Default::default()
+            },
+            GuiOverrides {
+                fallback_enabled: Some(false),
+                ..Default::default()
+            },
+            GuiOverrides {
+                fallback_ssid: Some("Another_Synthetic_WiFi".into()),
+                ..Default::default()
+            },
+            GuiOverrides {
+                fallback_password: Some("another-synthetic-password".into()),
+                ..Default::default()
+            },
+            GuiOverrides {
+                switch_back_interval: Some(300),
+                ..Default::default()
+            },
+        ] {
+            for paused in [false, true] {
+                let now = Instant::now();
+                let mut e = configured_engine(now);
+                e.snapshot.paused = paused;
+                e.next = now + Duration::from_secs(180);
+                e.primary_failures = 4;
+                e.probe_failures = 2;
+                e.fallback_failures = 3;
+                let changed_at = now + Duration::from_secs(1);
+                assert!(e.apply_saved_config(e.base.effective(&settings), changed_at));
+                assert_eq!(e.next, changed_at);
+                assert_eq!(e.snapshot.next_probe, (!paused).then_some(changed_at));
+                assert_eq!(e.primary_failures, 4);
+                assert_eq!(e.probe_failures, 2);
+                assert_eq!(e.fallback_failures, 3);
+            }
+        }
+    }
+    #[test]
+    fn ineffective_fallback_enable_does_not_reschedule() {
+        let now = Instant::now();
+        let mut e = configured_engine(now);
+        e.base.wifi.fallback.enabled = false;
+        e.base.wifi.fallback.ssid.clear();
+        e.config = e.base.effective(&GuiOverrides::default());
+        e.next = now + Duration::from_secs(180);
+        e.snapshot.next_probe = Some(e.next);
+        let next = e.next;
+        let settings = GuiOverrides {
+            fallback_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(e.apply_saved_config(e.base.effective(&settings), now));
+        assert!(!e.config.wifi.fallback.enabled);
+        assert_eq!(e.next, next);
+        assert_eq!(e.snapshot.next_probe, Some(next));
+    }
+    #[test]
+    fn invalid_inactive_appearance_palette_is_rejected_before_save() {
+        let mut settings = GuiOverrides {
+            appearance: Some(crate::config::Appearance::default()),
+            ..Default::default()
+        };
+        assert!(settings_valid(&settings));
+        settings
+            .appearance
+            .as_mut()
+            .unwrap()
+            .chatgpt
+            .dark
+            .text_color = Some("#bad-color".into());
+        assert!(!settings_valid(&settings));
     }
     #[test]
     fn fallback_connected_without_internet_reaches_offline() {

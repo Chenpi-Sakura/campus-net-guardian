@@ -1,8 +1,8 @@
 [package]
 name = "campus-net-guardian"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.90"
 description = "轻量 Windows 校园网认证守护工具"
 license = "MIT"
 build = "build.rs"
@@ -18,14 +18,21 @@ path = "src/main.rs"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize", "serialize"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "cookies", "rustls-tls"] }
 regex = "1"
 url = "2"
 html-escape = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "image-without-codecs", "advanced-shaping", "advanced"] }
+iced_anim = { version = "0.3.1", default-features = false, features = ["widgets"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = { version = "0.26", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Graphics_Dwm", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+iced_runtime = "0.14"

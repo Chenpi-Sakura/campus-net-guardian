@@ -36,7 +36,7 @@ try {
     if ($binary.ReadUInt32() -ne 0x00004550 -or $binary.ReadUInt16() -ne 0x8664) { throw "发布文件必须是 Windows x64 EXE" }
 } finally { $binary.Dispose() }
 $releaseFolder = Join-Path $repositoryPath "output\release"
-$packageName = "campus-guardian-$Tag-windows-x64"
+$packageName = "CUIT Helper $Tag Windows x64"
 $stageFolder = Join-Path $repositoryPath ("output\" + $packageName)
 [void][System.IO.Directory]::CreateDirectory($releaseFolder)
 [void][System.IO.Directory]::CreateDirectory($stageFolder)
@@ -44,18 +44,18 @@ $stageFolder = Join-Path $repositoryPath ("output\" + $packageName)
 if (-not $?) { throw "第三方许可证收集失败" }
 
 # 明确的白名单，绝不复制本地 config.yaml / gui_settings.json / 日志 / HAR。
-Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageFolder "campus-guardian.exe") -Force
+Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageFolder "CUIT Helper.exe") -Force
 Copy-Item -LiteralPath "config.example.yaml" -Destination $stageFolder -Force
 Copy-Item -LiteralPath "README.md" -Destination $stageFolder -Force
 if (-not (Test-Path -LiteralPath "LICENSE")) { throw "缺少 LICENSE，停止发布" }
 Copy-Item -LiteralPath "LICENSE" -Destination $stageFolder -Force
 Copy-Item -LiteralPath "output\THIRD_PARTY_NOTICES.txt" -Destination $stageFolder -Force
-$expectedFiles = @("campus-guardian.exe", "config.example.yaml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt")
+$expectedFiles = @("CUIT Helper.exe", "config.example.yaml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt")
 $unexpectedFiles = @(Get-ChildItem -LiteralPath $stageFolder -Force | Where-Object { $_.Name -notin $expectedFiles -or $_.PSIsContainer })
 if ($unexpectedFiles.Count) { throw "打包目录含有非白名单文件，停止发布：$($unexpectedFiles.Name -join ', ')" }
 $zipPath = Join-Path $releaseFolder "$packageName.zip"
 Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $stageFolder -File | Select-Object -ExpandProperty FullName) -DestinationPath $zipPath -Force
-$standalonePath = Join-Path $releaseFolder "campus-guardian.exe"
+$standalonePath = Join-Path $releaseFolder "CUIT Helper.exe"
 Copy-Item -LiteralPath $exePath -Destination $standalonePath -Force
 $releaseAssets = @($standalonePath, $zipPath)
 $hashFile = Join-Path $releaseFolder "SHA256SUMS.txt"
@@ -85,7 +85,7 @@ if ($Publish) {
     if ($remoteObject.type -ne "commit" -or $remoteObject.sha -cne $head) {
         throw "GitHub Tag 与本地已验证的 HEAD 不一致，停止发布"
     }
-    $releaseArguments = @("release", "create", $Tag, "--repo", $Repository, "--verify-tag", "--title", "Campus Net Guardian $Tag")
+    $releaseArguments = @("release", "create", $Tag, "--repo", $Repository, "--verify-tag", "--title", "CUIT Helper $Tag")
     if ($NotesFile) { $releaseArguments += @("--notes-file", (Resolve-Path -LiteralPath $NotesFile).Path) }
     else { $releaseArguments += "--generate-notes" }
     $releaseArguments += $releaseAssets + @($hashFile)

@@ -1,6 +1,11 @@
 [workspace]
 members = ["native"]
+exclude = ["vendor/iced_anim", "vendor/iced_tiny_skia"]
 resolver = "2"
+
+[patch.crates-io]
+iced_anim = { path = "vendor/iced_anim" }
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
 
 [profile.release]
 opt-level = "s"
