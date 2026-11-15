@@ -47,6 +47,8 @@
 ```powershell
 & '.\CUIT Helper.exe' --gui
 & '.\CUIT Helper.exe' --gui --hidden
+& '.\CUIT Helper.exe' --gui --paused
+& '.\CUIT Helper.exe' --gui --paused
 & '.\CUIT Helper.exe' --preview
 & '.\CUIT Helper.exe' --config .\config.yaml --once
 & '.\CUIT Helper.exe' --probe
@@ -56,6 +58,10 @@
 ```
 
 `--preview` 使用合成状态预览界面，不读取真实配置、不认证或切换 WiFi，也不保存设置或修改自启。
+
+`--paused` 以暂停自动守护的状态启动，适合先检查设置，再手动恢复守护。
+
+`--paused` 以暂停自动守护的状态启动，适合先检查设置，再手动恢复守护。
 
 认证流量会绕过系统代理并动态绑定 WLAN 地址；指定校园网 SSID 却没有可用无线地址时，会停止认证以避免误走其他网卡。
 

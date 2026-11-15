@@ -76,13 +76,21 @@ pub struct Worker {
 impl Worker {
     /// 启动唯一守护线程；所有认证、设置持久化和平台调用按消息顺序执行。
     pub fn start(config: AppConfig, overrides: GuiOverrides) -> Self {
+        Self::start_with_paused(config, overrides, false)
+    }
+    /// 启动守护线程，可在首次等待和网络周期之前进入暂停状态；不排队异步暂停命令。
+    pub fn start_with_paused(
+        config: AppConfig,
+        overrides: GuiOverrides,
+        start_paused: bool,
+    ) -> Self {
         let (commands, input) = mpsc::channel();
         let (output, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let handle = thread::Builder::new()
             .name("guardian-network".into())
-            .spawn(move || run(config, overrides, input, output, flag))
+            .spawn(move || run(config, overrides, input, output, flag, start_paused))
             .expect("无法启动守护线程");
         Self {
             commands,
@@ -116,8 +124,9 @@ fn run(
     input: Receiver<Command>,
     output: Sender<Event>,
     stop: Arc<AtomicBool>,
+    start_paused: bool,
 ) {
-    let mut engine = Engine::new(config, overrides, Instant::now());
+    let mut engine = Engine::new(config, overrides, Instant::now(), start_paused);
     let mut backend = RealBackend(stop.clone());
     engine.snapshot.autostart = platform::autostart_enabled();
     let log_config = std::cell::RefCell::new(engine.config.logging.clone());
@@ -137,7 +146,9 @@ fn run(
     }
     emit(Event::Snapshot(engine.snapshot.clone()));
     emit(Event::Log(
-        if valid {
+        if valid && start_paused {
+            "守护已暂停启动，网络保持不变"
+        } else if valid {
             "守护已启动"
         } else {
             "配置未完成，守护尚未启动"
@@ -258,13 +269,12 @@ fn run(
                 }
             },
             Err(RecvTimeoutError::Timeout) => {
-                if valid && !engine.snapshot.paused {
-                    engine.cycle(&mut backend, &mut emit, Instant::now());
-                }
+                engine.automatic_cycle(&mut backend, &mut emit, Instant::now(), valid);
             }
         }
     }
-    if engine.config.wifi.fallback.revert_on_stop {
+    // 从未执行过网络周期的暂停启动退出时也保持现有网络，不触发备用网络恢复。
+    if engine.network_started && engine.config.wifi.fallback.revert_on_stop {
         let _ = platform::ensure_fallback(&engine.config.wifi.fallback);
     }
     engine.snapshot.status = Status::Stopped;
@@ -421,14 +431,26 @@ struct Engine {
     probe_failures: u32,
     fallback_failures: u32,
     last_recovery: Instant,
+    network_started: bool,
 }
 impl Engine {
-    fn new(base: AppConfig, overrides: GuiOverrides, now: Instant) -> Self {
+    fn new(base: AppConfig, overrides: GuiOverrides, now: Instant, start_paused: bool) -> Self {
         let config = base.effective(&overrides);
+        let snapshot = if start_paused {
+            Snapshot {
+                paused: true,
+                status: Status::Paused,
+                detail: "守护已暂停启动，可手动登录或恢复守护".into(),
+                next_probe: None,
+                ..Snapshot::default()
+            }
+        } else {
+            Snapshot::default()
+        };
         Self {
             base,
             config,
-            snapshot: Snapshot::default(),
+            snapshot,
             mode: NetworkMode::Primary,
             next: now,
             session: None,
@@ -437,6 +459,7 @@ impl Engine {
             probe_failures: 0,
             fallback_failures: 0,
             last_recovery: now,
+            network_started: false,
         }
     }
 
@@ -469,7 +492,20 @@ impl Engine {
         valid
     }
 
+    fn automatic_cycle(
+        &mut self,
+        backend: &mut impl Backend,
+        emit: &mut impl FnMut(Event),
+        now: Instant,
+        valid: bool,
+    ) {
+        if valid && !self.snapshot.paused {
+            self.cycle(backend, emit, now);
+        }
+    }
+
     fn cycle(&mut self, backend: &mut impl Backend, emit: &mut impl FnMut(Event), now: Instant) {
+        self.network_started = true;
         let started = Instant::now();
         self.snapshot.busy = true;
         self.snapshot.status = if self.mode == NetworkMode::Primary {
@@ -727,7 +763,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.wifi.fallback.enabled = true;
         cfg.wifi.fallback.ssid = "Fallback_WiFi".into();
-        Engine::new(cfg, GuiOverrides::default(), now)
+        Engine::new(cfg, GuiOverrides::default(), now, false)
     }
     fn configured_engine(now: Instant) -> Engine {
         let mut cfg = AppConfig::default();
@@ -737,7 +773,63 @@ mod tests {
         cfg.account.password = "synthetic-password".into();
         cfg.wifi.fallback.enabled = true;
         cfg.wifi.fallback.ssid = "Fallback_WiFi".into();
-        Engine::new(cfg, GuiOverrides::default(), now)
+        Engine::new(cfg, GuiOverrides::default(), now, false)
+    }
+    #[test]
+    fn paused_start_is_initialized_before_any_cycle_and_never_calls_network_on_timeout() {
+        struct NoNetwork;
+        impl Backend for NoNetwork {
+            fn ssid(&mut self) -> Result<String> {
+                panic!("暂停启动不应读取 WLAN");
+            }
+            fn connect_primary(&mut self, _: &AppConfig) -> Result<bool> {
+                panic!("暂停启动不应连接主网络");
+            }
+            fn connect_fallback(&mut self, _: &AppConfig) -> Result<bool> {
+                panic!("暂停启动不应切换备用网络");
+            }
+            fn login(&mut self, _: &AppConfig) -> Result<AuthResult> {
+                panic!("暂停启动不应认证");
+            }
+            fn probe(&mut self, _: &AppConfig, _: Option<&str>) -> Result<bool> {
+                panic!("暂停启动不应探测网络");
+            }
+        }
+        let now = Instant::now();
+        let cfg = configured_engine(now).base;
+        let mut e = Engine::new(cfg, GuiOverrides::default(), now, true);
+        assert!(e.snapshot.paused);
+        assert_eq!(e.snapshot.status, Status::Paused);
+        assert!(!e.snapshot.busy);
+        assert!(e.snapshot.next_probe.is_none());
+        assert!(!e.snapshot.detail.is_empty());
+        assert!(!e.network_started);
+        let mut emitted = Vec::new();
+        let mut backend = NoNetwork;
+        // 即使首次等待意外提前超时，或已经过很久，也不能调用任何网络后端。
+        for seconds in [0, 1, 3600, 7200] {
+            e.automatic_cycle(
+                &mut backend,
+                &mut |event| emitted.push(event),
+                now + Duration::from_secs(seconds),
+                true,
+            );
+        }
+        assert!(emitted.is_empty());
+        assert!(!e.network_started, "未进行网络周期，退出也不得恢复备用网络");
+        assert!(e.snapshot.paused);
+        assert_eq!(e.snapshot.status, Status::Paused);
+        assert!(e.snapshot.next_probe.is_none());
+    }
+    #[test]
+    fn normal_start_remains_active_and_marks_network_work_before_cleanup() {
+        let now = Instant::now();
+        let mut e = configured_engine(now);
+        assert!(!e.snapshot.paused);
+        let mut backend = Fake::default();
+        e.automatic_cycle(&mut backend, &mut |_| {}, now, true);
+        assert_eq!(backend.primary_calls, 1);
+        assert!(e.network_started);
     }
     #[test]
     fn appearance_and_logging_changes_preserve_network_schedule_and_counters() {

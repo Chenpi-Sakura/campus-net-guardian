@@ -371,6 +371,7 @@ struct App {
     pending: bool,
     feedback: Option<String>,
     preview: bool,
+    start_paused: bool,
     exit_confirm: bool,
     exit_error: Option<String>,
     discard_on_exit: bool,
@@ -897,14 +898,21 @@ impl App {
             Message::Opened(id) => {
                 self.window = id;
                 match tray::Tray::new(self.preview, self.logo_color) {
-                    Ok(tray) => self.tray = Some(tray),
+                    Ok(tray) => {
+                        tray.set_paused(self.snapshot.paused);
+                        self.tray = Some(tray);
+                    }
                     Err(_) => {
                         self.feedback = Some("系统托盘不可用，请保持窗口打开".into());
                         self.visible = true;
                     }
                 }
                 if !self.preview {
-                    self.worker = Some(Worker::start(self.base.clone(), self.overrides.clone()));
+                    self.worker = Some(Worker::start_with_paused(
+                        self.base.clone(),
+                        self.overrides.clone(),
+                        self.start_paused,
+                    ));
                 }
                 let tasks = Task::batch([
                     window::scale_factor(id).map(Message::Scale),
@@ -1138,8 +1146,8 @@ fn load_logo(scale: f32, accent: [u8; 3]) -> Result<iced::widget::image::Handle>
     ))
 }
 
-/// 启动 Iced 面板；预览不读取真实配置、不启动后台、不改变网络或自启。
-pub fn run(config_path: PathBuf, preview: bool, hidden: bool) -> Result<()> {
+/// 启动 Iced 面板；预览不读取真实配置，暂停启动在后台首次网络周期前生效。
+pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool) -> Result<()> {
     let Some(guard) = tray::InstanceGuard::acquire(preview)? else {
         return Ok(());
     };
@@ -1181,7 +1189,7 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool) -> Result<()> {
     let primary = cached_theme.palette().primary;
     let theme_appearance = saved_appearance.clone();
     let logo_color = [primary.r, primary.g, primary.b].map(|n| (n * 255.0).round() as u8);
-    let snapshot = if preview {
+    let mut snapshot = if preview {
         Snapshot {
             status: Status::Online,
             online: true,
@@ -1201,6 +1209,14 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool) -> Result<()> {
             ..Snapshot::default()
         }
     };
+    if start_paused {
+        snapshot.paused = true;
+        snapshot.next_probe = None;
+        if startup_error.is_none() {
+            snapshot.status = Status::Paused;
+            snapshot.detail = "守护已暂停启动，可手动登录或恢复守护".into();
+        }
+    }
     let icon_image = image::load_from_memory(include_bytes!("../../logo.png"))?.to_rgba8();
     let icon = window::icon::from_rgba(
         icon_image.clone().into_raw(),
@@ -1229,6 +1245,7 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool) -> Result<()> {
         pending: false,
         feedback: None,
         preview,
+        start_paused,
         exit_confirm: false,
         exit_error: None,
         discard_on_exit: false,
@@ -1321,6 +1338,7 @@ mod tests {
             pending: false,
             feedback: None,
             preview: true,
+            start_paused: false,
             exit_confirm: false,
             exit_error: None,
             discard_on_exit: false,

@@ -26,6 +26,7 @@ struct Options {
     config: Option<PathBuf>,
     benchmark: bool,
     hidden: bool,
+    paused: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
@@ -47,6 +48,10 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--gui" => Mode::Gui,
             "--hidden" => {
                 result.hidden = true;
+                continue;
+            }
+            "--paused" => {
+                result.paused = true;
                 continue;
             }
             "--preview" | "--benchmark-ui" => {
@@ -74,8 +79,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
         mode_set = true;
         result.mode = mode;
     }
-    if result.mode != Mode::Gui && (result.hidden || result.benchmark) {
-        bail!("隐藏或离线预览参数只适用于桌面模式");
+    if result.mode != Mode::Gui && (result.hidden || result.benchmark || result.paused) {
+        bail!("隐藏、暂停启动或离线预览参数只适用于桌面模式");
     }
     if result.benchmark && result.config.is_some() {
         bail!("离线预览模式不接受真实配置文件");
@@ -99,7 +104,7 @@ fn run() -> Result<()> {
     }
     if options.mode == Mode::Help {
         println!(
-            "CUIT Helper\n--gui [--hidden]  桌面守护\n--preview       离线界面预览，不改变网络\n--config <路径>  指定配置\n--once          登录一次\n--probe         探测连接\n--check         校验配置\n--enable-autostart / --disable-autostart / --autostart-status\n--version"
+            "CUIT Helper\n--gui [--hidden] [--paused]  桌面守护，可暂停启动\n--preview       离线界面预览，不改变网络\n--config <路径>  指定配置\n--once          登录一次\n--probe         探测连接\n--check         校验配置\n--enable-autostart / --disable-autostart / --autostart-status\n--version"
         );
         return Ok(());
     }
@@ -125,7 +130,7 @@ fn run() -> Result<()> {
     }
     if options.mode == Mode::Gui {
         #[cfg(windows)]
-        return campus_guardian::ui::run(path, options.benchmark, options.hidden);
+        return campus_guardian::ui::run(path, options.benchmark, options.hidden, options.paused);
         #[cfg(not(windows))]
         bail!("桌面应用仅支持 Windows");
     }
@@ -187,5 +192,26 @@ mod tests {
         let result = parse(args(&["--gui", "--hidden"])).unwrap();
         assert!(result.hidden);
         assert_eq!(result.mode, Mode::Gui);
+    }
+    #[test]
+    fn paused_startup_is_gui_only_and_not_the_default() {
+        let result = parse(args(&["--gui", "--paused"])).unwrap();
+        assert!(result.paused);
+        assert_eq!(result.mode, Mode::Gui);
+        assert!(parse(args(&["--paused"])).unwrap().paused);
+        assert!(!parse(args(&["--gui", "--hidden"])).unwrap().paused);
+        for mode in [
+            "--once",
+            "--probe",
+            "--check",
+            "--enable-autostart",
+            "--disable-autostart",
+            "--autostart-status",
+            "--version",
+            "--help",
+        ] {
+            assert!(parse(args(&[mode, "--paused"])).is_err());
+            assert!(parse(args(&["--paused", mode])).is_err());
+        }
     }
 }
