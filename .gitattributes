@@ -1,0 +1,13 @@
+# 确保所有文本文件以 LF 提交（Windows 上 PowerShell / bash 兼容）
+* text=auto eol=lf
+
+# 二进制文件不参与换行转换
+*.har binary
+*.png binary
+*.ico binary
+*.jpg binary
+*.gif binary
+
+# PowerShell 脚本必须用 LF（跨平台兼容）
+*.ps1 text eol=lf
+*.psm1 text eol=lf
