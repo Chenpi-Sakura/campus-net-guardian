@@ -36,8 +36,8 @@ try {
     if ($binary.ReadUInt32() -ne 0x00004550 -or $binary.ReadUInt16() -ne 0x8664) { throw "发布文件必须是 Windows x64 EXE" }
 } finally { $binary.Dispose() }
 $releaseFolder = Join-Path $repositoryPath "output\release"
-$packageName = "CUIT Helper $Tag Windows x64"
-$stageFolder = Join-Path $repositoryPath ("output\" + $packageName)
+$packageName = "CUIT.Helper.$Tag.Windows.x64"
+$stageFolder = Join-Path $repositoryPath "output\CUIT Helper $Tag Windows x64"
 [void][System.IO.Directory]::CreateDirectory($releaseFolder)
 [void][System.IO.Directory]::CreateDirectory($stageFolder)
 & (Join-Path $PSScriptRoot "third_party_notices.ps1")
@@ -55,7 +55,7 @@ $unexpectedFiles = @(Get-ChildItem -LiteralPath $stageFolder -Force | Where-Obje
 if ($unexpectedFiles.Count) { throw "打包目录含有非白名单文件，停止发布：$($unexpectedFiles.Name -join ', ')" }
 $zipPath = Join-Path $releaseFolder "$packageName.zip"
 Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $stageFolder -File | Select-Object -ExpandProperty FullName) -DestinationPath $zipPath -Force
-$standalonePath = Join-Path $releaseFolder "CUIT Helper.exe"
+$standalonePath = Join-Path $releaseFolder "CUIT.Helper.exe"
 Copy-Item -LiteralPath $exePath -Destination $standalonePath -Force
 $releaseAssets = @($standalonePath, $zipPath)
 $hashFile = Join-Path $releaseFolder "SHA256SUMS.txt"
