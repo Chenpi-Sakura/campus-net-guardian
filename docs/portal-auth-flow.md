@@ -1,7 +1,7 @@
 # 校园网门户认证链路（逆向实证版）
 
 > 本文档基于 **2026-09-16 某高校校园网实网环境的完整抓包 + 实机验证**，
-> 记录 `campus-net-guardian` 认证核心的工作原理。下述约 1 秒耗时为迁移前的历史实网观察，并非 Rust 新版的实测耗时。
+> 记录 `campus-net-guardian` 认证核心的工作原理。
 >
 > 与早期假设（如"密码必须加密""sessionId 就是 SESSION cookie"）相冲突处，
 > **以本文档为准**。
@@ -12,14 +12,12 @@
 
 | 项目 | 实测结论 |
 |---|---|
-| 认证是否必须浏览器 | **否**。requests 路径 1 秒内完成全链路 |
+| 认证是否必须浏览器 | **否**。直接 HTTP 可完成全链路 |
 | 密码是否需要前端加密 | **否**。CAS POST 明文密码被服务端接受 |
 | reCAPTCHA 是否硬性校验 | **否**。无 token 仍返回 302 + ticket |
 | 真正的 sessionId | **网关拦截链产生的 12 位 hex `flowSessionId`** |
 | CAS `SESSION` cookie 能否当 sessionId | **不能**。eportal 返回 `code=400 找不到用户` |
 | 认证成功判据 | `getCurrentNode` 到 `finish` **且** `userOnline=true` **且** HTTPS 外网可达 |
-
-当前实测一次完整认证耗时 **约 1 秒**（不含 WiFi 关联）。
 
 ---
 

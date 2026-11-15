@@ -35,12 +35,6 @@ try {
     $binary.BaseStream.Position = $peOffset
     if ($binary.ReadUInt32() -ne 0x00004550 -or $binary.ReadUInt16() -ne 0x8664) { throw "发布文件必须是 Windows x64 EXE" }
 } finally { $binary.Dispose() }
-$exeHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
-$memoryReport = Join-Path $repositoryPath "output\memory-comparison.json"
-if (Test-Path -LiteralPath $memoryReport) {
-    $measurement = Get-Content -LiteralPath $memoryReport -Raw | ConvertFrom-Json
-    if ($measurement.rust_sha256 -cne $exeHash) { throw "内存报告对应另一份 EXE，需重新测量或移走过期报告" }
-}
 $releaseFolder = Join-Path $repositoryPath "output\release"
 $packageName = "campus-guardian-$Tag-windows-x64"
 $stageFolder = Join-Path $repositoryPath ("output\" + $packageName)
@@ -57,10 +51,6 @@ if (-not (Test-Path -LiteralPath "LICENSE")) { throw "缺少 LICENSE，停止发
 Copy-Item -LiteralPath "LICENSE" -Destination $stageFolder -Force
 Copy-Item -LiteralPath "output\THIRD_PARTY_NOTICES.txt" -Destination $stageFolder -Force
 $expectedFiles = @("campus-guardian.exe", "config.example.yaml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt")
-if (Test-Path -LiteralPath $memoryReport) {
-    Copy-Item -LiteralPath $memoryReport -Destination $stageFolder -Force
-    $expectedFiles += "memory-comparison.json"
-}
 $unexpectedFiles = @(Get-ChildItem -LiteralPath $stageFolder -Force | Where-Object { $_.Name -notin $expectedFiles -or $_.PSIsContainer })
 if ($unexpectedFiles.Count) { throw "打包目录含有非白名单文件，停止发布：$($unexpectedFiles.Name -join ', ')" }
 $zipPath = Join-Path $releaseFolder "$packageName.zip"
@@ -68,11 +58,6 @@ Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $stageFolder -File | 
 $standalonePath = Join-Path $releaseFolder "campus-guardian.exe"
 Copy-Item -LiteralPath $exePath -Destination $standalonePath -Force
 $releaseAssets = @($standalonePath, $zipPath)
-if (Test-Path -LiteralPath $memoryReport) {
-    $reportAsset = Join-Path $releaseFolder "memory-comparison.json"
-    Copy-Item -LiteralPath $memoryReport -Destination $reportAsset -Force
-    $releaseAssets += $reportAsset
-}
 $hashFile = Join-Path $releaseFolder "SHA256SUMS.txt"
 $hashLines = foreach ($file in $releaseAssets) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
