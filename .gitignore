@@ -57,6 +57,9 @@ diagnose.txt
 # Agent 本地沙箱（不可入仓）
 .codex_tmp/
 
+# 外部应用分析输入
+*.apk
+
 # Rust 构建与本地性能测量
 target/
 *.pdb

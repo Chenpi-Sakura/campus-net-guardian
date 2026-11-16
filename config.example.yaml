@@ -38,6 +38,14 @@ account:
   username: "__REPLACE_ME__"   # 学号 / 工号
   password: "__REPLACE_ME__"   # 门户登录密码
 
+# 校园跑的本机设置；主页临时选校区不会回写默认值
+running:
+  phone: ""
+  password: ""
+  default_campus: "demo-a"
+  # 本地相对米坐标 JSON；留空使用内置校区地图，格式见 config.routes.example.json
+  catalog_file: ""
+
 # WiFi 配置（需与 portal 配置配合；真实 SSID 仅在本地 config.yaml 中配置）
 wifi:
   # 目标 SSID（必须在 Windows 上手动连接过一次，让系统保存 profile）

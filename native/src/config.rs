@@ -19,6 +19,157 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub logging: LoggingConfig,
     pub env_overrides: BTreeMap<String, String>,
+    /// 校园跑账号与默认路线的本机 YAML 配置。
+    pub running: RunningSettings,
+}
+
+/// 校园跑账号与默认赛道设置，仅保存在本机主 YAML 中。
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct RunningSettings {
+    /// 校园跑账号手机号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub phone: String,
+    /// 校园跑账号密码，保留原始空格。
+    pub password: String,
+    /// 默认校园 ID。
+    pub default_campus: String,
+    /// 赛道目录文件路径。
+    pub catalog_file: String,
+}
+
+impl Default for RunningSettings {
+    fn default() -> Self {
+        Self {
+            phone: String::new(),
+            password: String::new(),
+            default_campus: "demo-a".into(),
+            catalog_file: String::new(),
+        }
+    }
+}
+
+impl RunningSettings {
+    /// 校验校园跑设置，不在错误中包含字段值。
+    pub fn validate(&self) -> Result<()> {
+        if !self.phone.is_empty()
+            && (self.phone.len() != 11 || !self.phone.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            bail!("校园跑手机号必须为空或 11 位 ASCII 数字");
+        }
+        if self.password.len() > 1024 || self.password.contains('\0') {
+            bail!("校园跑密码长度或字符无效");
+        }
+        if self.default_campus.is_empty()
+            || self.default_campus.len() > 64
+            || !self
+                .default_campus
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("默认校园 ID 格式无效");
+        }
+        if self.catalog_file.chars().count() > 4096
+            || self.catalog_file.contains(['\0', '\r', '\n'])
+            || self.catalog_file.starts_with(r"\\")
+            || self.catalog_file.starts_with("//")
+        {
+            bail!("赛道目录文件路径长度或字符无效");
+        }
+        Ok(())
+    }
+
+    /// 仅生成相对上一草稿发生变化的校园跑字段。
+    pub fn patch_against(&self, previous: &Self) -> RunningPatch {
+        let changed =
+            |current: &String, prior: &String| (current != prior).then(|| current.clone());
+        RunningPatch {
+            phone: changed(&self.phone, &previous.phone),
+            password: changed(&self.password, &previous.password),
+            default_campus: changed(&self.default_campus, &previous.default_campus),
+            catalog_file: changed(&self.catalog_file, &previous.catalog_file),
+        }
+    }
+}
+
+/// 校园跑 YAML 字段白名单；不实现 Debug 或 Serialize，避免凭据意外外泄。
+#[derive(Clone, Default)]
+pub struct RunningPatch {
+    /// 修改手机号。
+    pub phone: Option<String>,
+    /// 修改密码。
+    pub password: Option<String>,
+    /// 修改默认校园 ID。
+    pub default_campus: Option<String>,
+    /// 修改赛道目录文件路径。
+    pub catalog_file: Option<String>,
+}
+
+impl RunningPatch {
+    /// 判断是否没有明确修改的字段。
+    pub fn is_empty(&self) -> bool {
+        self.phone.is_none()
+            && self.password.is_none()
+            && self.default_campus.is_none()
+            && self.catalog_file.is_none()
+    }
+
+    /// 合并最新 YAML 中的校园跑白名单字段并原子写回。
+    pub fn save_to(&self, path: &Path) -> Result<PrimarySaveOutcome> {
+        if self.is_empty() {
+            return Ok(PrimarySaveOutcome::default());
+        }
+        let target = fs::canonicalize(path).map_err(|_| anyhow::anyhow!("无法读取配置文件"))?;
+        let original =
+            fs::read_to_string(&target).map_err(|_| anyhow::anyhow!("无法读取配置文件"))?;
+        let mut document: serde_json::Value = serde_saphyr::from_str_with_options(
+            &original,
+            serde_saphyr::options! { no_schema: true },
+        )
+        .map_err(|_| anyhow::anyhow!("配置格式无效，请先修正 YAML 格式"))?;
+        let typed: AppConfig = serde_saphyr::from_str(&original)
+            .map_err(|_| anyhow::anyhow!("配置格式无效，请检查 YAML 字段与类型"))?;
+        restore_known_string_values(&mut document, &typed);
+        let running = RunningSettings {
+            phone: self.phone.clone().unwrap_or(typed.running.phone),
+            password: self.password.clone().unwrap_or(typed.running.password),
+            default_campus: self
+                .default_campus
+                .clone()
+                .unwrap_or(typed.running.default_campus),
+            catalog_file: self
+                .catalog_file
+                .clone()
+                .unwrap_or(typed.running.catalog_file),
+        };
+        running.validate()?;
+        let root = document
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("配置顶层必须是 YAML 映射"))?;
+        let section = root
+            .entry("running")
+            .or_insert_with(|| serde_json::json!({}));
+        if section.is_null() {
+            *section = serde_json::json!({});
+        }
+        let section = section
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("校园跑配置必须是 YAML 映射"))?;
+        for (name, value) in [
+            ("phone", &running.phone),
+            ("password", &running.password),
+            ("default_campus", &running.default_campus),
+            ("catalog_file", &running.catalog_file),
+        ] {
+            section.insert(name.into(), serde_json::Value::String(value.clone()));
+        }
+        let serialized =
+            serde_saphyr::to_string(&document).map_err(|_| anyhow::anyhow!("无法生成配置文件"))?;
+        let parsed: AppConfig = serde_saphyr::from_str(&serialized)
+            .map_err(|_| anyhow::anyhow!("配置格式无效，请检查 YAML 字段与类型"))?;
+        parsed.running.validate()?;
+        write_primary_atomic(&target, &original, serialized.as_bytes())
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -527,6 +678,10 @@ fn restore_known_string_values(document: &mut serde_json::Value, original: &AppC
         ("/wifi/fallback/auth", &original.wifi.fallback.auth),
         ("/logging/file", &original.logging.file),
         ("/logging/level", &original.logging.level),
+        ("/running/phone", &original.running.phone),
+        ("/running/password", &original.running.password),
+        ("/running/default_campus", &original.running.default_campus),
+        ("/running/catalog_file", &original.running.catalog_file),
     ] {
         if let Some(current) = document.pointer_mut(path)
             && !current.is_string()
@@ -1915,5 +2070,87 @@ env_overrides: {}
         assert!(value.get("portal").is_none());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn running_settings_defaults_roundtrip_and_preserve_other_yaml_fields() {
+        let legacy = PRIMARY_YAML;
+        let old: AppConfig = serde_saphyr::from_str(legacy).unwrap();
+        assert!(old.running == RunningSettings::default());
+        let yaml = format!(
+            "{legacy}\nrunning:\n  phone: 12345678901\n  password: ' synthetic pass '\n  default_campus: campus_1\n  catalog_file: tracks.yaml\n"
+        );
+        let loaded: AppConfig = serde_saphyr::from_str(&yaml).unwrap();
+        assert_eq!(loaded.running.phone, "12345678901");
+        assert_eq!(loaded.running.password, " synthetic pass ");
+        loaded.running.validate().unwrap();
+        with_primary_yaml(legacy, |path| {
+            RunningPatch {
+                phone: Some("12345678901".into()),
+                password: Some(" synthetic pass ".into()),
+                default_campus: Some("campus_1".into()),
+                catalog_file: Some("tracks.yaml".into()),
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(saved.running == loaded.running);
+            assert_eq!(saved.wifi.ssid, "Synthetic_Campus_WiFi");
+            assert_eq!(saved.account.username, "synthetic-user");
+            let actual: serde_json::Value =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            let expected: serde_json::Value = serde_saphyr::from_str(legacy).unwrap();
+            assert_eq!(actual["unknown"], expected["unknown"]);
+        });
+        let json = serde_json::to_value(GuiOverrides::default()).unwrap();
+        assert!(json.get("running").is_none());
+        assert!(json.get("phone").is_none());
+        assert!(json.get("password").is_none());
+    }
+
+    #[test]
+    fn running_invalid_patch_does_not_modify_yaml() {
+        for patch in [
+            RunningPatch {
+                phone: Some("123".into()),
+                ..Default::default()
+            },
+            RunningPatch {
+                default_campus: Some("bad campus".into()),
+                ..Default::default()
+            },
+            RunningPatch {
+                password: Some("bad\0password".into()),
+                ..Default::default()
+            },
+        ] {
+            with_primary_yaml(PRIMARY_YAML, |path| {
+                let before = fs::read(path).unwrap();
+                assert!(patch.save_to(path).is_err());
+                assert_eq!(fs::read(path).unwrap(), before);
+            });
+        }
+    }
+
+    #[test]
+    fn primary_patch_preserves_existing_running_fields() {
+        let yaml = format!(
+            "{PRIMARY_YAML}\nrunning:\n  phone: 12345678901\n  password: ' synthetic pass '\n  default_campus: campus_1\n  catalog_file: tracks.yaml\n"
+        );
+        with_primary_yaml(&yaml, |path| {
+            PrimaryPatch {
+                ssid: Some("Updated_Synthetic_WiFi".into()),
+                ..Default::default()
+            }
+            .save_to_with_env(path, |_| None)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.phone, "12345678901");
+            assert_eq!(saved.running.password, " synthetic pass ");
+            assert_eq!(saved.running.default_campus, "campus_1");
+            assert_eq!(saved.running.catalog_file, "tracks.yaml");
+        });
     }
 }

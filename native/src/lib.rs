@@ -3,5 +3,6 @@ pub mod auth;
 pub mod config;
 pub mod daemon;
 pub mod platform;
+pub mod running;
 #[cfg(windows)]
 pub mod ui;

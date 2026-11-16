@@ -41,6 +41,36 @@ $upstreamLicenses = @{
         Url = 'https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt'
         Sha256 = 'A2010F343487D3F7618AFFE54F789F5487602331C0A8D03F49E9A7C547CF0499'
     }
+    'float_next_after@1.0.0' = @{
+        License = 'MIT'
+        Url = 'https://gitlab.com/bronsonbdevost/next_afterf/-/raw/6f555d52667acda6237f88588a3d1f4e8a840c7e/LICENSE'
+        Sha256 = '0604D5817110DACC5C7D9B7DE6B58B962794603D4823C357157BD5DEC4198BC5'
+    }
+    'lyon@1.0.19' = @{
+        License = 'MIT OR Apache-2.0'
+        Url = 'https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT'
+        Sha256 = '80F275E90D799911ED3830A7F242A2EF5A4ADE2092FE0AA07BFB2D2CF2F2B95E'
+    }
+    'lyon_algorithms@1.0.22' = @{
+        License = 'MIT OR Apache-2.0'
+        Url = 'https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT'
+        Sha256 = '80F275E90D799911ED3830A7F242A2EF5A4ADE2092FE0AA07BFB2D2CF2F2B95E'
+    }
+    'lyon_geom@1.0.20' = @{
+        License = 'MIT OR Apache-2.0'
+        Url = 'https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT'
+        Sha256 = '80F275E90D799911ED3830A7F242A2EF5A4ADE2092FE0AA07BFB2D2CF2F2B95E'
+    }
+    'lyon_path@1.0.19' = @{
+        License = 'MIT OR Apache-2.0'
+        Url = 'https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT'
+        Sha256 = '80F275E90D799911ED3830A7F242A2EF5A4ADE2092FE0AA07BFB2D2CF2F2B95E'
+    }
+    'lyon_tessellation@1.0.23' = @{
+        License = 'MIT OR Apache-2.0'
+        Url = 'https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT'
+        Sha256 = '80F275E90D799911ED3830A7F242A2EF5A4ADE2092FE0AA07BFB2D2CF2F2B95E'
+    }
 }
 function Get-SupplementalLicense($Package) {
     $entry = $upstreamLicenses["$($Package.name)@$($Package.version)"]

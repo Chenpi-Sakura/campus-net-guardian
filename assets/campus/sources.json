@@ -1,0 +1,30 @@
+[
+  {
+    "campus": "航空港校区",
+    "osm_boundary": "https://www.openstreetmap.org/way/543945074",
+    "api_source": "https://api.openstreetmap.org/api/0.6/map",
+    "origin_wgs84": [
+      103.9803568,
+      30.5810703
+    ],
+    "meters_per_longitude_degree": 95832.66456276501,
+    "meters_per_latitude_degree": 111320,
+    "projection": "local equirectangular, x east / y north",
+    "license": "ODbL-1.0",
+    "attribution": "© OpenStreetMap contributors · ODbL 1.0"
+  },
+  {
+    "campus": "龙泉校区",
+    "osm_boundary": "https://www.openstreetmap.org/way/477890047",
+    "api_source": "https://api.openstreetmap.org/api/0.6/map",
+    "origin_wgs84": [
+      104.2997346,
+      30.6060395
+    ],
+    "meters_per_longitude_degree": 95808.86072817372,
+    "meters_per_latitude_degree": 111320,
+    "projection": "local equirectangular, x east / y north",
+    "license": "ODbL-1.0",
+    "attribution": "© OpenStreetMap contributors · ODbL 1.0"
+  }
+]

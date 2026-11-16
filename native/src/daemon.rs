@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{AuthClient, AuthResult},
-    config::{AppConfig, GuiOverrides, PrimaryPatch},
+    config::{AppConfig, GuiOverrides, PrimaryPatch, RunningPatch},
     platform,
 };
 use anyhow::Result;
@@ -54,6 +54,8 @@ pub enum Command {
     Pause(bool),
     Settings(Box<GuiOverrides>),
     PrimarySettings(Box<PrimaryPatch>, std::path::PathBuf),
+    /// 串行持久化校园跑设置，不修改校园网守护状态。
+    RunningSettings(Box<RunningPatch>, std::path::PathBuf),
     Autostart(bool, std::path::PathBuf),
     ScanNetworks,
     Stop,
@@ -65,6 +67,8 @@ pub enum Event {
     Networks(Vec<String>),
     SettingsSaved(bool),
     PrimarySettingsSaved(bool, Option<&'static str>),
+    /// 校园跑配置保存结果及不含敏感信息的清理提示。
+    RunningSettingsSaved(bool, Option<&'static str>),
 }
 
 pub struct Worker {
@@ -240,6 +244,24 @@ fn run(
                     Err(error) => {
                         emit(Event::Log(format!("主网络设置保存失败：{error:#}")));
                         emit(Event::PrimarySettingsSaved(false, None));
+                    }
+                }
+            }
+            Ok(Command::RunningSettings(patch, path)) => {
+                // 校园跑配置独立写回，不修改守护使用中的 Engine 或网络状态。
+                match patch.save_to(&path) {
+                    Ok(outcome) => {
+                        emit(Event::Log("校园跑设置已保存".into()));
+                        if let Some(warning) = outcome.warning {
+                            emit(Event::Log(format!("校园跑设置清理失败：{warning}")));
+                        }
+                        emit(Event::RunningSettingsSaved(true, outcome.warning));
+                    }
+                    Err(_) => {
+                        emit(Event::Log(
+                            "校园跑设置保存失败，请检查配置文件与目录权限".into(),
+                        ));
+                        emit(Event::RunningSettingsSaved(false, None));
                     }
                 }
             }
