@@ -294,6 +294,8 @@ fn settings_valid(s: &GuiOverrides) -> bool {
             .is_none_or(|v| matches!(v.as_str(), "INFO" | "DEBUG"))
         && s.fallback_ssid.as_ref().is_none_or(|v| v.len() <= 32)
         && s.appearance.as_ref().is_none_or(|v| v.validate().is_ok())
+        && s.display_scale
+            .is_none_or(|v| crate::config::DISPLAY_SCALE_PRESETS.contains(&v))
 }
 
 fn network_settings_changed(before: &AppConfig, after: &AppConfig) -> bool {
@@ -832,7 +834,7 @@ mod tests {
         assert!(e.network_started);
     }
     #[test]
-    fn appearance_and_logging_changes_preserve_network_schedule_and_counters() {
+    fn appearance_logging_and_scale_changes_preserve_network_schedule_and_counters() {
         for (mode, paused, fallback_enabled) in [
             (NetworkMode::Primary, false, true),
             (NetworkMode::Fallback, false, true),
@@ -840,7 +842,7 @@ mod tests {
             (NetworkMode::Offline, false, true),
             (NetworkMode::Primary, true, true),
         ] {
-            for change in 0..3 {
+            for change in 0..4 {
                 let now = Instant::now();
                 let mut e = configured_engine(now);
                 e.base.wifi.fallback.enabled = fallback_enabled;
@@ -861,8 +863,9 @@ mod tests {
                 let settings = GuiOverrides {
                     probe_interval: Some(e.config.daemon.probe_interval),
                     failure_threshold: Some(e.config.daemon.failure_threshold),
-                    appearance: (change != 1).then(crate::config::Appearance::default),
-                    log_level: (change != 0).then(|| "DEBUG".into()),
+                    appearance: matches!(change, 0 | 2).then(crate::config::Appearance::default),
+                    log_level: matches!(change, 1 | 2).then(|| "DEBUG".into()),
+                    display_scale: (change == 3).then_some(200),
                     ..Default::default()
                 };
                 assert!(
@@ -880,7 +883,11 @@ mod tests {
                 assert_eq!(e.last_recovery, now);
                 assert_eq!(
                     e.config.logging.level,
-                    if change == 0 { "INFO" } else { "DEBUG" }
+                    if matches!(change, 1 | 2) {
+                        "DEBUG"
+                    } else {
+                        "INFO"
+                    }
                 );
             }
         }
@@ -965,6 +972,34 @@ mod tests {
             .dark
             .text_color = Some("#bad-color".into());
         assert!(!settings_valid(&settings));
+    }
+    #[test]
+    fn only_preset_display_scales_are_accepted_before_save() {
+        let mut settings = GuiOverrides::default();
+        assert!(settings_valid(&settings));
+        for &scale in crate::config::DISPLAY_SCALE_PRESETS {
+            settings.display_scale = Some(scale);
+            assert!(settings_valid(&settings));
+        }
+        for scale in [
+            0,
+            49,
+            51,
+            66,
+            68,
+            89,
+            91,
+            99,
+            101,
+            124,
+            126,
+            199,
+            201,
+            u16::MAX,
+        ] {
+            settings.display_scale = Some(scale);
+            assert!(!settings_valid(&settings));
+        }
     }
     #[test]
     fn fallback_connected_without_internet_reaches_offline() {
