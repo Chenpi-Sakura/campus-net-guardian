@@ -11,7 +11,11 @@
     "meters_per_latitude_degree": 111320,
     "projection": "local equirectangular, x east / y north",
     "license": "ODbL-1.0",
-    "attribution": "© OpenStreetMap contributors · ODbL 1.0"
+    "attribution": "© OpenStreetMap contributors · ODbL 1.0",
+    "running_tracks": [
+      "https://www.openstreetmap.org/way/1064792511",
+      "https://www.openstreetmap.org/way/1064792456"
+    ]
   },
   {
     "campus": "龙泉校区",

@@ -85,10 +85,12 @@ pub enum Noise {
     Light,
     /// 中等扰动。
     Medium,
+    /// 约二十米的有界强扰动，仅用于本地模拟。
+    Strong,
 }
 impl Noise {
     /// 全部支持的扰动等级。
-    pub const ALL: &'static [Self] = &[Self::Off, Self::Light, Self::Medium];
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Light, Self::Medium, Self::Strong];
 }
 impl fmt::Display for Noise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,6 +98,7 @@ impl fmt::Display for Noise {
             Self::Off => "关闭",
             Self::Light => "轻微（本地模拟）",
             Self::Medium => "中等（本地模拟）",
+            Self::Strong => "强（约20米）",
         })
     }
 }
@@ -337,6 +340,12 @@ pub fn generate(
     })?;
     let target = request.distance_m as f64;
     let mut rng = Rng(request.seed);
+    let track_nodes: HashSet<_> = campus
+        .routes
+        .iter()
+        .filter(|route| route.id.starts_with("track-"))
+        .flat_map(|route| route.nodes.iter().copied())
+        .collect();
     let preset = request
         .preset_id
         .as_ref()
@@ -361,9 +370,17 @@ pub fn generate(
         }
         nodes
     });
-    let start = sequence
-        .as_ref()
-        .map_or_else(|| rng.usize(campus.nodes.len()), |route| route[0]);
+    let start = if let Some(route) = &sequence {
+        route[0]
+    } else {
+        let roads: Vec<_> = (0..campus.nodes.len())
+            .filter(|node| !track_nodes.contains(node))
+            .collect();
+        if roads.is_empty() {
+            bail!("此校区没有可随机生成的校园道路");
+        }
+        roads[rng.usize(roads.len())]
+    };
     let mut raw = vec![campus.nodes[start].point];
     let mut travelled = 0.0;
     let mut current = start;
@@ -382,12 +399,24 @@ pub fn generate(
             n
         } else {
             let edges = &campus.nodes[current].edges;
-            let options: Vec<_> = edges
+            let available: Vec<_> = edges
+                .iter()
+                .copied()
+                .filter(|node| !track_nodes.contains(node))
+                .collect();
+            if available.is_empty() {
+                bail!("校园道路连接不完整");
+            }
+            let options: Vec<_> = available
                 .iter()
                 .copied()
                 .filter(|&j| Some(j) != previous)
                 .collect();
-            let options = if options.is_empty() { edges } else { &options };
+            let options = if options.is_empty() {
+                &available
+            } else {
+                &options
+            };
             options[rng.usize(options.len())]
         };
         let a = campus.nodes[current].point;
@@ -416,8 +445,9 @@ pub fn generate(
     let reference = raw.clone();
     let amplitude = match request.noise {
         Noise::Off => 0.0,
-        Noise::Light => 0.35,
-        Noise::Medium => 0.8,
+        Noise::Light => 0.8,
+        Noise::Medium => 3.0,
+        Noise::Strong => 20.0,
     };
     let phase = rng.unit() * std::f64::consts::TAU;
     let mut positions = vec![raw[0]];
@@ -439,12 +469,16 @@ pub fn generate(
             }
             let t = i as f64 / samples as f64;
             let d = along + t * length;
-            let shift = amplitude
-                * (std::f64::consts::PI * t).sin()
-                * (0.65 * (d / 37. + phase).sin() + 0.35 * (d / 13. - phase).sin());
+            let envelope = (std::f64::consts::PI * d / target).sin();
+            let dx = amplitude / std::f64::consts::SQRT_2
+                * envelope
+                * (0.65 * (d / 90. + phase).sin() + 0.35 * (d / 210. - phase).sin());
+            let dy = amplitude / std::f64::consts::SQRT_2
+                * envelope
+                * (0.65 * (d / 120. - phase).cos() + 0.35 * (d / 180. + phase).sin());
             positions.push(Point {
-                x: a.x + (b.x - a.x) * t - (b.y - a.y) / length * shift,
-                y: a.y + (b.y - a.y) * t + (b.x - a.x) / length * shift,
+                x: a.x + (b.x - a.x) * t + dx,
+                y: a.y + (b.y - a.y) * t + dy,
             });
         }
         along += length;
@@ -478,10 +512,10 @@ fn distance(a: Point, b: Point) -> f64 {
     (a.x - b.x).hypot(a.y - b.y)
 }
 struct Rng(u64);
-/// 生成成组的模拟默认值：距离 1500–3000 米，取整后的配速保持 6–9 分钟每公里。
+/// 生成成组的模拟默认值：距离精确到米，范围 1500–4500 米，配速保持 6–9 分钟每公里。
 pub fn random_parameters(seed: u64) -> (u32, u32) {
     let mut rng = Rng(seed);
-    let distance = 1500 + 100 * rng.usize(16) as u32;
+    let distance = 1500 + rng.usize(3001) as u32;
     let pace = 360 + rng.usize(181) as u32;
     let minimum = (distance * 360).div_ceil(60_000);
     let maximum = distance * 540 / 60_000;
@@ -508,17 +542,45 @@ impl Rng {
 mod tests {
     use super::*;
     #[test]
+    fn strong_noise_is_visible_bounded_and_keeps_endpoints() {
+        let campus = demo_catalog().campuses.remove(0);
+        let mut request = req(5);
+        request.distance_m = 2000;
+        request.noise = Noise::Off;
+        let base = generate(&campus, &request, &AtomicBool::new(false)).unwrap();
+        request.noise = Noise::Strong;
+        let noisy = generate(&campus, &request, &AtomicBool::new(false)).unwrap();
+        let maximum = base
+            .points
+            .iter()
+            .zip(&noisy.points)
+            .map(|(a, b)| distance(a.position, b.position))
+            .fold(0.0_f64, f64::max);
+        assert!(maximum > 10.0 && maximum <= 20.000001);
+        assert_eq!(
+            base.points.first().unwrap().position,
+            noisy.points.first().unwrap().position
+        );
+        assert!(
+            distance(
+                base.points.last().unwrap().position,
+                noisy.points.last().unwrap().position
+            ) < 1e-8
+        );
+    }
+    #[test]
     fn random_defaults_vary_and_integer_duration_keeps_the_pace_range() {
         let mut values = std::collections::HashSet::new();
         for seed in 0..1000 {
             let (distance, minutes) = random_parameters(seed);
-            assert!((1500..=3000).contains(&distance));
+            assert!((1500..=4500).contains(&distance));
             let pace = minutes as f64 * 60_000. / distance as f64;
             assert!((360.0..=540.0).contains(&pace));
             assert_eq!(random_parameters(seed), (distance, minutes));
             values.insert((distance, minutes));
         }
         assert!(values.len() > 50);
+        assert!(values.iter().any(|(distance, _)| distance % 100 != 0));
     }
     fn req(seed: u64) -> GenerateRequest {
         GenerateRequest {

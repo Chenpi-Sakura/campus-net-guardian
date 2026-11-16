@@ -131,7 +131,7 @@ impl State {
             password_visible: false,
             distance: distance.to_string(),
             minutes: minutes.to_string(),
-            noise: Noise::Light,
+            noise: Noise::Strong,
             random_parameters: true,
             preview: None,
             map_preview: None,
@@ -143,7 +143,7 @@ impl State {
             status: None,
             catalog,
             campus_override: None,
-            preset: None,
+            preset: Some("@track".into()),
             loaded_file: String::new(),
             base_dir,
             job: None,
@@ -198,10 +198,7 @@ impl State {
     pub(super) fn campus_choices(&self) -> Vec<Choice> {
         std::iter::once(Choice {
             id: String::new(),
-            name: format!(
-                "使用默认校区 · {}",
-                self.choice(&self.prefs.default_campus).name
-            ),
+            name: format!("默认 · {}", self.choice(&self.prefs.default_campus).name),
         })
         .chain(self.default_campus_choices())
         .collect()
@@ -228,7 +225,7 @@ impl State {
     pub(super) fn route_choices(&self) -> Vec<Choice> {
         let mut choices = vec![Choice {
             id: String::new(),
-            name: "随机生成".into(),
+            name: "校园内道路（随机）".into(),
         }];
         if let Some(campus) = self
             .catalog
@@ -236,9 +233,21 @@ impl State {
             .iter()
             .find(|c| c.id == self.active_id())
         {
+            choices.push(Choice {
+                id: "@track".into(),
+                name: "运动场（随机环线）".into(),
+            });
             choices.extend(campus.routes.iter().map(|r| Choice {
                 id: r.id.clone(),
-                name: r.name.clone(),
+                name: format!(
+                    "{} · {}",
+                    if r.id.starts_with("track-") {
+                        "运动场"
+                    } else {
+                        "校园内道路"
+                    },
+                    r.name
+                ),
             }));
         }
         choices
@@ -246,10 +255,10 @@ impl State {
     pub(super) fn selected_route(&self) -> Choice {
         self.route_choices()
             .into_iter()
-            .find(|c| Some(&c.id) == self.preset.as_ref())
+            .find(|c| c.id == self.preset.as_deref().unwrap_or(""))
             .unwrap_or(Choice {
                 id: String::new(),
-                name: "随机生成".into(),
+                name: "校园内道路（随机）".into(),
             })
     }
     fn invalidate(&mut self, clear: bool) {
@@ -406,10 +415,23 @@ impl State {
                 .map(|v| v.as_nanos() as u64)
                 .unwrap_or(1)
                 ^ self.seed.wrapping_add(1);
+            let preset_id = if self.preset.as_deref() == Some("@track") {
+                let tracks: Vec<_> = campus
+                    .routes
+                    .iter()
+                    .filter(|r| r.id.starts_with("track-"))
+                    .collect();
+                if tracks.is_empty() {
+                    bail!("此校区暂缺已核实的跑道数据，请选择校园内道路");
+                }
+                Some(tracks[seed as usize % tracks.len()].id.clone())
+            } else {
+                self.preset.clone()
+            };
             Ok((
                 campus,
                 GenerateRequest {
-                    preset_id: self.preset.clone(),
+                    preset_id,
                     distance_m: distance,
                     duration_seconds: minutes * 60,
                     noise: self.noise,

@@ -715,27 +715,49 @@ fn global_nav(app: &App, compact: bool) -> Element<'static, Message> {
         .width(Fill)
         .padding([7, 4])
         .style(if app.page == Page::Home {
-            primary
+            active_tab
         } else {
-            secondary
+            inactive_tab
         });
     let running = button(centered("校园跑", size))
         .on_press(Message::OpenRunning)
         .width(Fill)
         .padding([7, 4])
         .style(if app.page == Page::Running {
-            primary
+            active_tab
         } else {
-            secondary
+            inactive_tab
         });
-    let settings = button(label("设置", size))
+    let settings = button(centered("设置", size))
         .on_press(Message::OpenSettings)
+        .width(Fill)
         .padding([7, 7])
-        .style(quiet);
+        .style(inactive_tab);
     row![home, running, settings]
         .spacing(4)
         .align_y(Alignment::Center)
         .into()
+}
+
+fn active_tab(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = primary(theme, status);
+    style.border.radius = iced::border::Radius {
+        top_left: 9.0,
+        top_right: 9.0,
+        bottom_left: 0.0,
+        bottom_right: 0.0,
+    };
+    style
+}
+fn inactive_tab(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = secondary(theme, status);
+    style.border.radius = iced::border::Radius {
+        top_left: 9.0,
+        top_right: 9.0,
+        bottom_left: 0.0,
+        bottom_right: 0.0,
+    };
+    style
 }
 
 fn toggle_row<'a>(
@@ -961,9 +983,9 @@ fn settings_tabs(app: &App, compact: bool) -> Element<'_, Message> {
                 .width(Fill)
                 .padding([7, 2])
                 .style(if app.settings_tab == tab {
-                    primary
+                    active_tab
                 } else {
-                    secondary
+                    inactive_tab
                 }),
         );
     }
@@ -1152,6 +1174,12 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         plot_height,
     );
     let mut metrics = column![plot].spacing(9);
+    if state.noise == crate::running::Noise::Strong {
+        metrics = metrics.push(muted(
+            "强扰动最大20米，可能偏出跑道，仅用于本地模拟。",
+            11.0,
+        ));
+    }
     if let Some(preview) = &state.preview {
         let km = preview.distance_m / 1000.0;
         let seconds = preview.duration_seconds;
@@ -1637,7 +1665,6 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
         },
     );
     let mut page = column![
-        global_nav(app, compact),
         inset_content(
             header,
             iced::Padding {
