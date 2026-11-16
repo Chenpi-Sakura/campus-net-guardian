@@ -38,6 +38,25 @@ account:
   username: "__REPLACE_ME__"   # 学号 / 工号
   password: "__REPLACE_ME__"   # 门户登录密码
 
+# 校园跑的本机设置；主页临时选校区不会回写默认值
+# 平台接入字段与账号一同在设置页编辑、自动保存；base_url 留空表示禁用平台功能
+running:
+  phone: ""
+  password: ""
+  default_campus: "demo-a"
+  # 本地相对米坐标 JSON；留空使用内置校区地图，格式见 config.routes.example.json
+  catalog_file: ""
+  base_url: ""          # 平台服务根地址，必须 https
+  app_key: ""           # 平台客户端 appkey
+  app_secret: ""        # 平台请求签名密钥（敏感！仅本机填写）
+  school_id: ""         # 平台学校 ID（数字）
+  app_version: "1.8.0"  # 上报的客户端版本号
+  brand: ""             # 上报的手机品牌
+  mobile_type: ""       # 上报的手机型号
+  sys_version: ""       # 上报的手机系统版本
+  device_type: "1"      # 上报的设备类型标识
+  device_token: ""      # 上报的设备推送令牌，可为空
+
 # WiFi 配置（需与 portal 配置配合；真实 SSID 仅在本地 config.yaml 中配置）
 wifi:
   # 目标 SSID（必须在 Windows 上手动连接过一次，让系统保存 profile）

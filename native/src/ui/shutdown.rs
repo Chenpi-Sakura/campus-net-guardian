@@ -1,7 +1,10 @@
 //! 退出时先结束守护和旧保存，再串行持久化最终草稿，避免旧 ACK 覆盖最新修改。
 
 use crate::{
-    config::{GuiOverrides, PrimaryPatch, PrimarySaveOutcome, PrimarySettings},
+    config::{
+        GuiOverrides, PrimaryPatch, PrimarySaveOutcome, PrimarySettings, RunningPatch,
+        RunningSettings,
+    },
     daemon::Worker,
     platform,
 };
@@ -11,6 +14,7 @@ use std::{path::PathBuf, sync::mpsc, thread};
 #[derive(Clone)]
 pub(super) struct Plan {
     pub(super) primary: Option<(PrimaryPatch, PrimarySettings)>,
+    pub(super) running: Option<(RunningPatch, RunningSettings)>,
     pub(super) overrides: Option<GuiOverrides>,
     // 仅由用户明确切换自启产生；generation 防止迟到结果覆盖新选择。
     pub(super) autostart: Option<(bool, u64)>,
@@ -18,6 +22,7 @@ pub(super) struct Plan {
 
 pub(super) struct Outcome {
     pub(super) primary_saved: bool,
+    pub(super) running_saved: bool,
     pub(super) settings_saved: bool,
     pub(super) autostart: Option<(bool, u64)>,
     pub(super) error: Option<String>,
@@ -28,12 +33,14 @@ pub(super) fn run_with(
     preview: bool,
     finish_worker: impl FnOnce(),
     mut save_primary: impl FnMut(&PrimaryPatch) -> Result<PrimarySaveOutcome>,
+    mut save_running: impl FnMut(&RunningPatch) -> Result<PrimarySaveOutcome>,
     mut save: impl FnMut(&GuiOverrides) -> Result<()>,
     mut autostart: impl FnMut(bool) -> Result<()>,
 ) -> Outcome {
     finish_worker();
     let mut outcome = Outcome {
         primary_saved: false,
+        running_saved: false,
         settings_saved: false,
         autostart: None,
         error: None,
@@ -59,6 +66,27 @@ pub(super) fn run_with(
         }
         outcome.primary_saved = true;
     }
+    if let Some((patch, _)) = &plan.running {
+        if !preview {
+            match save_running(patch) {
+                Ok(saved) => {
+                    outcome.running_saved = true;
+                    if let Some(warning) = saved.warning {
+                        outcome.error = Some(warning.into());
+                        return outcome;
+                    }
+                }
+                Err(_) => {
+                    outcome.error = Some(
+                        "退出前校园跑设置保存失败；请检查配置文件与目录权限后重试，或明确放弃修改退出"
+                            .into(),
+                    );
+                    return outcome;
+                }
+            }
+        }
+        outcome.running_saved = true;
+    }
     if let Some(overrides) = &plan.overrides {
         if !preview && save(overrides).is_err() {
             outcome.error =
@@ -80,6 +108,7 @@ pub(super) fn run_with(
 
 pub(super) fn launch(
     worker: Option<Worker>,
+    running_job: Option<super::running_panel::Job>,
     plan: Plan,
     preview: bool,
     config_path: PathBuf,
@@ -87,6 +116,9 @@ pub(super) fn launch(
     // 先设置取消标志，不让等待线程调度期间继续后续认证步骤。
     if let Some(worker) = &worker {
         worker.request_stop();
+    }
+    if let Some(job) = &running_job {
+        job.cancel();
     }
     let (sender, receiver) = mpsc::channel();
     let thread = thread::spawn(move || {
@@ -97,7 +129,11 @@ pub(super) fn launch(
                 if let Some(worker) = worker {
                     worker.join();
                 }
+                if let Some(job) = running_job {
+                    job.join();
+                }
             },
+            |patch| patch.save_to(&config_path),
             |patch| patch.save_to(&config_path),
             GuiOverrides::save,
             |enabled| {
@@ -121,6 +157,7 @@ mod tests {
     fn plan() -> Plan {
         Plan {
             primary: None,
+            running: None,
             overrides: Some(GuiOverrides {
                 fallback_ssid: Some("Latest_Synthetic_WiFi".into()),
                 ..GuiOverrides::default()
@@ -141,6 +178,7 @@ mod tests {
                 order.borrow_mut().push("join");
             },
             |_| panic!("没有主网络草稿时不得写主网络配置"),
+            |_| panic!("没有校园跑草稿时不得写校园跑配置"),
             |overrides| {
                 *stored.borrow_mut() = overrides.fallback_ssid.clone().unwrap();
                 order.borrow_mut().push("save");
@@ -164,6 +202,7 @@ mod tests {
             true,
             || {},
             |_| panic!("预览不得写主网络配置"),
+            |_| panic!("预览不得写校园跑配置"),
             |_| panic!("预览不得写文件"),
             |_| panic!("预览不得修改自启"),
         );
@@ -181,6 +220,7 @@ mod tests {
             false,
             || {},
             |_| panic!("没有主网络草稿时不得写主网络配置"),
+            |_| panic!("没有校园跑草稿时不得写校园跑配置"),
             |_| bail!("synthetic save failure"),
             |_| panic!("保存失败后不得修改自启"),
         );
@@ -219,6 +259,7 @@ mod tests {
                 order.borrow_mut().push("primary");
                 Ok(PrimarySaveOutcome::default())
             },
+            |_| panic!("没有校园跑草稿时不得写校园跑配置"),
             |_| {
                 assert_eq!(*stored_primary.borrow(), "Latest_Synthetic_Campus");
                 order.borrow_mut().push("gui");
@@ -249,6 +290,7 @@ mod tests {
                 order.borrow_mut().push("primary");
                 bail!("synthetic failure")
             },
+            |_| panic!("主网络失败后不得写校园跑配置"),
             |_| panic!("主网络失败后不得写 GUI 配置"),
             |_| panic!("主网络失败后不得修改自启"),
         );
@@ -268,6 +310,7 @@ mod tests {
             false,
             || {},
             |_| Ok(PrimarySaveOutcome::default()),
+            |_| panic!("没有校园跑草稿时不得写校园跑配置"),
             |_| bail!("synthetic GUI failure"),
             |_| panic!("GUI 失败后不得修改自启"),
         );
@@ -289,11 +332,61 @@ mod tests {
                     warning: Some("已保存，私有旧配置清理失败"),
                 })
             },
+            |_| panic!("主网络清理警告须先可见反馈"),
             |_| panic!("警告须先可见反馈"),
             |_| panic!("警告期间不修改自启"),
         );
         assert!(result.primary_saved);
         assert!(!result.settings_saved);
         assert!(result.error.as_deref().unwrap().contains("清理失败"));
+    }
+
+    fn running_draft() -> (RunningPatch, RunningSettings) {
+        let settings = RunningSettings {
+            phone: "13800138000".into(),
+            password: "synthetic-running-password".into(),
+            ..RunningSettings::default()
+        };
+        let patch = RunningPatch {
+            phone: Some(settings.phone.clone()),
+            password: Some(settings.password.clone()),
+            ..RunningPatch::default()
+        };
+        (patch, settings)
+    }
+
+    #[test]
+    fn running_exit_save_follows_primary_and_failure_stops_later_writes() {
+        let mut plan = plan();
+        plan.primary = Some(primary_draft());
+        plan.running = Some(running_draft());
+        plan.autostart = Some((true, 11));
+        let order = RefCell::new(Vec::new());
+        let result = run_with(
+            &plan,
+            false,
+            || order.borrow_mut().push("join"),
+            |_| {
+                order.borrow_mut().push("primary");
+                Ok(PrimarySaveOutcome::default())
+            },
+            |patch| {
+                assert_eq!(patch.phone.as_deref(), Some("13800138000"));
+                order.borrow_mut().push("running");
+                bail!("synthetic running failure")
+            },
+            |_| panic!("running 失败后不得写 GUI 配置"),
+            |_| panic!("running 失败后不得修改自启"),
+        );
+        assert_eq!(*order.borrow(), ["join", "primary", "running"]);
+        assert!(result.primary_saved && !result.running_saved && !result.settings_saved);
+        assert!(result.autostart.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("校园跑设置保存失败")
+        );
     }
 }

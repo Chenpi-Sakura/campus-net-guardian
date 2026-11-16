@@ -2,7 +2,7 @@
 
 use super::{
     App, DisplayScaleChoice, IntervalChoice, Message, Page, RecoveryChoice, ServiceChoice,
-    ThresholdChoice, motion, scroll_edge, smooth_scroll,
+    SettingsTab, ThresholdChoice, motion, scroll_edge, smooth_scroll,
 };
 use crate::config::{ThemeMode, ThemeStyle};
 use crate::daemon::Status;
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const TWO_COLUMN_WIDTH: f32 = 680.0;
 const CONTENT_MAX_WIDTH: f32 = 1000.0;
 const COMPACT_WIDTH: f32 = 320.0;
+const RUNNING_WIDE_WIDTH: f32 = 760.0;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -375,17 +376,24 @@ fn notice<'a>(message: impl ToString, error: bool) -> Element<'a, Message> {
 /// 根据应用状态呈现同一窗口中的首页、设置页或退出确认。
 pub(super) fn view(app: &App) -> Element<'_, Message> {
     let key = if app.exit_confirm {
-        2
-    } else if app.page == Page::Home {
-        0
+        5
     } else {
-        1
+        match app.page {
+            Page::Home => 0,
+            Page::Running => 1,
+            Page::Settings => match app.settings_tab {
+                SettingsTab::Global => 2,
+                SettingsTab::Network => 3,
+                SettingsTab::Running => 4,
+            },
+        }
     };
     let page = if app.exit_confirm {
         exit_confirmation(app)
     } else {
         match app.page {
             Page::Home => home(app),
+            Page::Running => running(app),
             Page::Settings => settings(app),
         }
     };
@@ -622,15 +630,18 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let mut content = column![inset_content(
-        header,
-        iced::Padding {
-            top: if compact { 12.0 } else { 16.0 },
-            right: 27.0,
-            left: 16.0,
-            ..Default::default()
-        }
-    )]
+    let mut content = column![
+        global_nav(app, compact),
+        inset_content(
+            header,
+            iced::Padding {
+                top: if compact { 12.0 } else { 16.0 },
+                right: 27.0,
+                left: 16.0,
+                ..Default::default()
+            }
+        )
+    ]
     .spacing(10);
     if app.preview {
         content = content.push(inset_content(
@@ -695,6 +706,58 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
         ))
         .height(Fill)
         .into()
+}
+
+fn global_nav(app: &App, compact: bool) -> Element<'static, Message> {
+    let size = if compact { 11.0 } else { 12.0 };
+    let home = button(centered("网络守护", size))
+        .on_press(Message::OpenHome)
+        .width(Fill)
+        .padding([7, 4])
+        .style(if app.page == Page::Home {
+            active_tab
+        } else {
+            inactive_tab
+        });
+    let running = button(centered("校园跑", size))
+        .on_press(Message::OpenRunning)
+        .width(Fill)
+        .padding([7, 4])
+        .style(if app.page == Page::Running {
+            active_tab
+        } else {
+            inactive_tab
+        });
+    let settings = button(centered("设置", size))
+        .on_press(Message::OpenSettings)
+        .width(Fill)
+        .padding([7, 7])
+        .style(inactive_tab);
+    row![home, running, settings]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+fn active_tab(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = primary(theme, status);
+    style.border.radius = iced::border::Radius {
+        top_left: 9.0,
+        top_right: 9.0,
+        bottom_left: 0.0,
+        bottom_right: 0.0,
+    };
+    style
+}
+fn inactive_tab(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = secondary(theme, status);
+    style.border.radius = iced::border::Radius {
+        top_left: 9.0,
+        top_right: 9.0,
+        bottom_left: 0.0,
+        bottom_right: 0.0,
+    };
+    style
 }
 
 fn toggle_row<'a>(
@@ -896,6 +959,530 @@ fn settings(app: &App) -> Element<'_, Message> {
     responsive(move |size| settings_at_width(app, size.width)).into()
 }
 
+fn settings_tabs(app: &App, compact: bool) -> Element<'_, Message> {
+    let tabs = if compact {
+        [
+            (SettingsTab::Global, "全局"),
+            (SettingsTab::Network, "校园网"),
+            (SettingsTab::Running, "校园跑"),
+        ]
+    } else {
+        [
+            (SettingsTab::Global, "全局设置"),
+            (SettingsTab::Network, "校园网设置"),
+            (SettingsTab::Running, "校园跑设置"),
+        ]
+    };
+    let mut row = iced::widget::Row::new()
+        .spacing(if compact { 2 } else { 4 })
+        .width(Fill);
+    for (tab, name) in tabs {
+        row = row.push(
+            button(centered(name, 12.0))
+                .on_press(Message::SettingsTab(tab))
+                .width(Fill)
+                .padding([7, 2])
+                .style(if app.settings_tab == tab {
+                    active_tab
+                } else {
+                    inactive_tab
+                }),
+        );
+    }
+    inset_content(
+        row,
+        iced::Padding {
+            left: 16.0,
+            right: 16.0,
+            ..Default::default()
+        },
+    )
+}
+
+fn running_settings(app: &App, compact: bool) -> Element<'_, Message> {
+    let running = &app.running;
+    let password = text_input("校园跑密码", &running.prefs.password)
+        .size(13)
+        .padding([8, 10])
+        .secure(!running.password_visible)
+        .on_input(|value| Message::Running(super::running_panel::Message::Password(value)))
+        .style(field);
+    let default_campuses = running.default_campus_choices();
+    let campus_pick = pick_list(
+        default_campuses,
+        Some(running.selected_default_campus()),
+        |choice| Message::Running(super::running_panel::Message::DefaultCampus(choice)),
+    )
+    .width(Fill)
+    .padding([7, 10])
+    .text_size(13)
+    .style(selection)
+    .menu_style(menu);
+    let mut fields =
+        column![
+            muted("校园跑账号", 11.5),
+            network_field("手机号", "手机号", &running.prefs.phone, |value| {
+                Message::Running(super::running_panel::Message::Phone(value))
+            },),
+            column![
+                label("密码", 12.0),
+                row![
+                    password,
+                    button(label(
+                        if running.password_visible {
+                            "隐藏"
+                        } else {
+                            "显示"
+                        },
+                        12.0
+                    ))
+                    .on_press(Message::Running(
+                        super::running_panel::Message::TogglePassword
+                    ))
+                    .padding([8, 10])
+                    .style(quiet)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            ]
+            .spacing(5),
+            select_row(compact, "默认校区", campus_pick),
+            column![
+                label("路线目录文件", 12.0),
+                row![
+                    text_input("本地路线 JSON 文件路径", &running.prefs.catalog_file)
+                        .size(13)
+                        .padding([8, 10])
+                        .on_input(|value| Message::Running(
+                            super::running_panel::Message::CatalogFile(value)
+                        ))
+                        .style(field),
+                    button(label("载入", 12.0))
+                        .on_press_maybe((!running.busy()).then_some(Message::Running(
+                            super::running_panel::Message::LoadCatalog
+                        )))
+                        .padding([8, 10])
+                        .style(secondary)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            ]
+            .spacing(5),
+            muted(
+                "留空使用航空港与龙泉校区底图；本次校区不会修改默认校区。",
+                11.0
+            ),
+            muted("平台接入", 11.5),
+            platform_field(
+                "服务地址",
+                "https://…",
+                &running.prefs.base_url,
+                super::running_panel::PlatformField::BaseUrl,
+            ),
+            platform_field(
+                "Appkey",
+                "平台 appkey",
+                &running.prefs.app_key,
+                super::running_panel::PlatformField::AppKey,
+            ),
+            column![
+                label("签名密钥", 12.0),
+                text_input("平台签名密钥", &running.prefs.app_secret)
+                    .size(13)
+                    .padding([8, 10])
+                    .secure(true)
+                    .on_input(|value| {
+                        Message::Running(super::running_panel::Message::PlatformField(
+                            super::running_panel::PlatformField::AppSecret,
+                            value,
+                        ))
+                    })
+                    .style(field)
+            ]
+            .spacing(5),
+            platform_field(
+                "学校 ID",
+                "数字",
+                &running.prefs.school_id,
+                super::running_panel::PlatformField::SchoolId,
+            ),
+            platform_field(
+                "客户端版本",
+                "1.8.0",
+                &running.prefs.app_version,
+                super::running_panel::PlatformField::AppVersion,
+            ),
+            platform_field(
+                "手机品牌",
+                "例如 Xiaomi",
+                &running.prefs.brand,
+                super::running_panel::PlatformField::Brand,
+            ),
+            platform_field(
+                "手机型号",
+                "例如 23127PN0CC",
+                &running.prefs.mobile_type,
+                super::running_panel::PlatformField::MobileType,
+            ),
+            platform_field(
+                "系统版本",
+                "例如 14",
+                &running.prefs.sys_version,
+                super::running_panel::PlatformField::SysVersion,
+            ),
+            platform_field(
+                "设备类型",
+                "1",
+                &running.prefs.device_type,
+                super::running_panel::PlatformField::DeviceType,
+            ),
+            platform_field(
+                "设备令牌",
+                "可留空",
+                &running.prefs.device_token,
+                super::running_panel::PlatformField::DeviceToken,
+            ),
+            muted(
+                "平台接入与账号一同自动保存；契约修改在下次登录时生效。",
+                11.0
+            )
+        ]
+        .spacing(10);
+    if let Some(error) = &running.error {
+        fields = fields.push(notice(error, true));
+    } else if let Some(status) = &running.status {
+        fields = fields.push(muted(status, 11.0));
+    }
+    fields.into()
+}
+
+fn running(app: &App) -> Element<'_, Message> {
+    responsive(move |size| running_at_size(app, size)).into()
+}
+
+fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
+    use super::running_panel::Message as RunMessage;
+    let width = size.width;
+    let compact = width < COMPACT_WIDTH;
+    let wide = width >= RUNNING_WIDE_WIDTH;
+    let state = &app.running;
+    let map_width = if wide {
+        (width - 32.0).min(CONTENT_MAX_WIDTH) - 316.0
+    } else {
+        (width - 32.0).min(CONTENT_MAX_WIDTH)
+    };
+    let map_aspect = state
+        .preview_for_plot()
+        .and_then(|preview| preview.map.as_ref())
+        .map(|map| ((map.bounds[2] - map.bounds[0]) / (map.bounds[3] - map.bounds[1])) as f32)
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.5);
+    let available_height = if wide {
+        (size.height - 220.0).clamp(220.0, 420.0)
+    } else {
+        (size.height * 0.65).clamp(220.0, 420.0)
+    };
+    let plot_height = ((map_width - 24.0).max(1.0) / map_aspect + 84.0)
+        .min(available_height)
+        .clamp(150.0, 420.0);
+    let campuses = state.campus_choices();
+    let routes = state.route_choices();
+    let campus = pick_list(campuses, Some(state.selected_campus()), |choice| {
+        Message::Running(RunMessage::Campus(choice))
+    })
+    .width(Fill)
+    .padding([7, 10])
+    .text_size(13)
+    .style(selection)
+    .menu_style(menu);
+    let route = pick_list(routes, Some(state.selected_route()), |choice| {
+        Message::Running(RunMessage::Route(choice))
+    })
+    .width(Fill)
+    .padding([7, 10])
+    .text_size(13)
+    .style(selection)
+    .menu_style(menu);
+    let mut noise = iced::widget::Row::new().spacing(3).width(Fill);
+    for &level in crate::running::Noise::ALL {
+        let control = button(centered(level, 12.0))
+            .width(Fill)
+            .padding([6, 4])
+            .on_press(Message::Running(RunMessage::Noise(level)))
+            .style(if state.noise == level {
+                primary
+            } else {
+                secondary
+            });
+        let hint = if level == crate::running::Noise::Off {
+            "不添加模拟偏移".into()
+        } else {
+            format!("最大模拟偏移：{} 米", level.max_offset_m())
+        };
+        noise = noise.push(
+            iced::widget::tooltip(
+                control,
+                label(hint, 12.0),
+                iced::widget::tooltip::Position::Top,
+            )
+            .style(surface),
+        );
+    }
+    let distance = network_field(
+        "目标距离（米）",
+        "例如 2000",
+        &state.distance,
+        |value| Message::Running(RunMessage::Distance(value)),
+    );
+    let minutes = network_field(
+        "目标时间（分钟）",
+        "例如 25",
+        &state.minutes,
+        |value| Message::Running(RunMessage::Minutes(value)),
+    );
+    let inputs: Element<'_, Message> = if width < 380.0 || wide {
+        column![distance, minutes].spacing(8).into()
+    } else {
+        row![distance, minutes].spacing(10).into()
+    };
+    let controls = column![
+        select_row(compact, "本次校区", campus),
+        select_row(compact, "路线", route),
+        inputs,
+        column![label("路线扰动", 13.0), noise].spacing(5),
+        toggle_row(
+            "随机距离与时长",
+            "模拟配速 6–9 分钟/公里",
+            state.random_parameters,
+            |value| Message::Running(RunMessage::RandomParameters(value))
+        )
+    ]
+    .spacing(9);
+    let plot = state.plot.view(
+        state.preview_for_plot(),
+        state.progress,
+        state.revision,
+        plot_height,
+    );
+    let mut metrics = column![plot].spacing(9);
+    if state.noise == crate::running::Noise::Strong {
+        metrics = metrics.push(muted(
+            "强扰动最大20米，可能偏出跑道，仅用于本地模拟。",
+            11.0,
+        ));
+    }
+    if state.selected_route().id == "@track" && state.active_track_estimated() {
+        metrics = metrics.push(muted("此校区运动场环线为估算几何，非实测数据。", 11.0));
+    }
+    if let Some(preview) = &state.preview {
+        let km = preview.distance_m / 1000.0;
+        let seconds = preview.duration_seconds;
+        let pace = if km > 0.0 { seconds as f64 / km } else { 0.0 };
+        let stats = row![
+            column![
+                muted("预览里程", 10.5),
+                label(format!("{km:.2} 公里"), 13.0)
+            ]
+            .spacing(3)
+            .width(Fill),
+            column![
+                muted("预计时间", 10.5),
+                label(format!("{} 分钟", seconds / 60), 13.0)
+            ]
+            .spacing(3)
+            .width(Fill),
+            column![
+                muted("配速", 10.5),
+                label(
+                    format!("{}′{:02}″/公里", (pace / 60.0) as u32, (pace as u32) % 60),
+                    13.0
+                )
+            ]
+            .spacing(3)
+            .width(Fill)
+        ]
+        .spacing(8);
+        let stats: Element<'_, Message> = if compact {
+            column![
+                row![
+                    column![
+                        muted("预览里程", 10.5),
+                        label(format!("{km:.2} 公里"), 13.0)
+                    ]
+                    .spacing(3)
+                    .width(Fill),
+                    column![
+                        muted("预计时间", 10.5),
+                        label(format!("{} 分钟", seconds / 60), 13.0)
+                    ]
+                    .spacing(3)
+                    .width(Fill)
+                ]
+                .spacing(8),
+                column![
+                    muted("配速", 10.5),
+                    label(
+                        format!("{}′{:02}″/公里", (pace / 60.0) as u32, (pace as u32) % 60),
+                        13.0
+                    )
+                ]
+                .spacing(3)
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            stats.into()
+        };
+        metrics = metrics.push(stats);
+    }
+    metrics = metrics.push(
+        iced::widget::slider(0.0..=100.0, state.progress, |value| {
+            Message::Running(RunMessage::Progress(value))
+        })
+        .step(1.0_f32),
+    );
+    if let Some(error) = &state.error {
+        metrics = metrics.push(notice(error, true));
+    }
+    if let Some(status) = &state.status {
+        metrics = metrics.push(notice(status, false));
+    }
+    let generate = button(centered("生成路线预览", 13.0))
+        .on_press_maybe((!state.busy()).then_some(Message::Running(RunMessage::Generate)))
+        .width(Fill)
+        .padding([8, 12])
+        .style(primary);
+    let cancel = button(centered("取消", 13.0))
+        .on_press_maybe(state.busy().then_some(Message::Running(RunMessage::Cancel)))
+        .width(Fill)
+        .padding([8, 12])
+        .style(secondary);
+    let platform = &state.platform;
+    let contract_configured = state.prefs.platform_contract().configured();
+    let platform_status = if app.preview {
+        "平台：离线预览不连接".to_owned()
+    } else if !contract_configured {
+        "平台：未配置，请在设置中填写平台接入".to_owned()
+    } else if platform.busy {
+        "平台：请求进行中…".to_owned()
+    } else if platform.logged_in {
+        match &platform.semester {
+            Some(semester) => format!("平台：已登录 · 学期 {semester}"),
+            None => "平台：已登录".to_owned(),
+        }
+    } else {
+        "平台：未登录".to_owned()
+    };
+    let platform_login = button(centered("登录平台", 12.0))
+        .on_press_maybe(
+            (!app.preview && !platform.busy && contract_configured)
+                .then_some(Message::Running(RunMessage::PlatformLogin)),
+        )
+        .padding([6, 10])
+        .style(secondary);
+    let platform_submit = button(centered("提交记录", 12.0))
+        .on_press_maybe(
+            (!app.preview && platform.logged_in && !platform.busy && state.submission().is_some())
+                .then_some(Message::Running(RunMessage::PlatformSubmit)),
+        )
+        .padding([6, 10])
+        .style(primary);
+    let platform_buttons = row![platform_login, platform_submit].spacing(8);
+    let mut platform_area = if compact {
+        column![label(platform_status, 12.0), platform_buttons].spacing(6)
+    } else {
+        column![
+            row![label(platform_status, 12.0).width(Fill), platform_buttons]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(6)
+    };
+    if let Some((text, is_error)) = &platform.notice {
+        platform_area = platform_area.push(notice(text, *is_error));
+    }
+    let plot_area = column![
+        metrics,
+        line(),
+        platform_area,
+        muted("生成数据为本地模拟，点击提交记录后才会上传。", 11.0)
+    ]
+    .spacing(12)
+    .width(Fill);
+    let main_content: Element<'_, Message> = if wide {
+        row![
+            container(controls).width(300),
+            container(plot_area).width(Fill)
+        ]
+        .spacing(16)
+        .into()
+    } else {
+        column![controls, line(), plot_area].spacing(12).into()
+    };
+    let body = inset_content(
+        main_content,
+        iced::Padding {
+            left: 16.0,
+            right: 16.0,
+            top: 12.0,
+            bottom: 8.0,
+        },
+    );
+    column![
+        global_nav(app, compact),
+        inset_content(
+            title("校园跑", 21.0),
+            iced::Padding {
+                left: 16.0,
+                right: 16.0,
+                top: 10.0,
+                ..Default::default()
+            }
+        ),
+        line(),
+        container(scroll_edge::wrap(smooth_scroll::wrap(
+            scrollable(body)
+                .height(Fill)
+                .width(Fill)
+                .direction(scrollable::Direction::Vertical(edge_scrollbar()))
+                .style(scrollbar)
+        )))
+        .height(Fill),
+        line(),
+        inset_content(
+            row![generate, cancel].spacing(8),
+            iced::Padding {
+                left: 16.0,
+                right: 16.0,
+                bottom: 10.0,
+                top: 8.0,
+            }
+        )
+    ]
+    .height(Fill)
+    .into()
+}
+
+fn platform_field<'a>(
+    name: &'static str,
+    placeholder: &'static str,
+    value: &'a str,
+    target: super::running_panel::PlatformField,
+) -> Element<'a, Message> {
+    column![
+        label(name, 12.0),
+        text_input(placeholder, value)
+            .size(13)
+            .padding([8, 10])
+            .on_input(move |value| {
+                Message::Running(super::running_panel::Message::PlatformField(target, value))
+            })
+            .style(field)
+    ]
+    .spacing(5)
+    .into()
+}
+
 fn network_field<'a>(
     name: &'static str,
     placeholder: &'static str,
@@ -1027,7 +1614,7 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
     .spacing(5)
     .width(Fill);
     if !compact {
-        heading = heading.push(muted("让守护按照你的习惯工作。", 12.0));
+        heading = heading.push(muted("按照你的习惯设置 CUIT Helper。", 12.0));
     }
     let header = row![
         heading,
@@ -1209,40 +1796,24 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
     ]
     .spacing(10);
 
-    let body: Element<'_, Message> = if width >= TWO_COLUMN_WIDTH {
-        row![
-            column![
-                primary_network(app, compact),
-                line(),
-                appearance(app, compact),
-                line(),
-                start
-            ]
+    let global_body: Element<'_, Message> =
+        column![appearance(app, compact), line(), start, line(), files]
             .spacing(12)
-            .width(Fill),
-            column![fallback, line(), guardian, line(), files]
-                .spacing(12)
-                .width(Fill)
-        ]
-        .spacing(20)
-        .align_y(Alignment::Start)
-        .into()
-    } else {
-        column![
-            primary_network(app, compact),
-            line(),
-            appearance(app, compact),
-            line(),
-            start,
-            line(),
-            fallback,
-            line(),
-            guardian,
-            line(),
-            files
-        ]
-        .spacing(12)
-        .into()
+            .into();
+    let network_body: Element<'_, Message> = column![
+        primary_network(app, compact),
+        line(),
+        fallback,
+        line(),
+        guardian
+    ]
+    .spacing(12)
+    .into();
+    let running_body: Element<'_, Message> = running_settings(app, compact);
+    let body: Element<'_, Message> = match app.settings_tab {
+        SettingsTab::Global => global_body,
+        SettingsTab::Network => network_body,
+        SettingsTab::Running => running_body,
     };
     let body = inset_content(
         body,
@@ -1253,15 +1824,18 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
             top: 12.0,
         },
     );
-    let mut page = column![inset_content(
-        header,
-        iced::Padding {
-            top: if compact { 12.0 } else { 16.0 },
-            right: 27.0,
-            left: 16.0,
-            ..Default::default()
-        }
-    )]
+    let mut page = column![
+        inset_content(
+            header,
+            iced::Padding {
+                top: if compact { 12.0 } else { 16.0 },
+                right: 27.0,
+                left: 16.0,
+                ..Default::default()
+            }
+        ),
+        settings_tabs(app, compact)
+    ]
     .spacing(if compact { 8 } else { 12 });
     if app.preview {
         page = page.push(inset_content(

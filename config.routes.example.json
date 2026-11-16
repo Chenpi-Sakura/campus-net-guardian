@@ -1,0 +1,17 @@
+{
+  "campuses": [
+    {
+      "id": "demo-a",
+      "name": "示例校区（合成）",
+      "nodes": [
+        { "point": { "x": 0, "y": 0 }, "edges": [1, 3] },
+        { "point": { "x": 120, "y": 0 }, "edges": [0, 2] },
+        { "point": { "x": 120, "y": 90 }, "edges": [1, 3] },
+        { "point": { "x": 0, "y": 90 }, "edges": [0, 2] }
+      ],
+      "routes": [
+        { "id": "loop", "name": "示例环线", "nodes": [0, 1, 2, 3, 0] }
+      ]
+    }
+  ]
+}

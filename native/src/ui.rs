@@ -2,6 +2,8 @@
 mod appearance;
 mod autosave;
 mod motion;
+mod route_plot;
+mod running_panel;
 mod scroll_edge;
 mod shutdown;
 mod smooth_scroll;
@@ -12,7 +14,7 @@ mod window_icons;
 use crate::{
     config::{
         self, AppConfig, Appearance, ColorOverrides, GuiOverrides, PrimaryPatch, PrimarySettings,
-        ThemeMode, ThemeStyle,
+        RunningPatch, RunningSettings, ThemeMode, ThemeStyle,
     },
     daemon::{Command, Event, Snapshot, Status, Worker},
     platform,
@@ -32,7 +34,14 @@ use std::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Home,
+    Running,
     Settings,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Global,
+    Network,
+    Running,
 }
 macro_rules! choices {
     ($name:ident, $ty:ty, [$($value:literal),+], $unit:literal) => {
@@ -288,6 +297,7 @@ impl Form {
 struct PendingSave {
     overrides: GuiOverrides,
     primary_settings: PrimarySettings,
+    running_settings: RunningSettings,
     autostart: Option<(bool, u64)>,
     revision: u64,
 }
@@ -304,6 +314,10 @@ enum Message {
     Login,
     TogglePause,
     OpenSettings,
+    OpenHome,
+    OpenRunning,
+    SettingsTab(SettingsTab),
+    Running(running_panel::Message),
     Back,
     PrimarySsid(String),
     Username(String),
@@ -353,6 +367,10 @@ impl fmt::Debug for Message {
             Self::Login => "Login",
             Self::TogglePause => "TogglePause",
             Self::OpenSettings => "OpenSettings",
+            Self::OpenHome => "OpenHome",
+            Self::OpenRunning => "OpenRunning",
+            Self::SettingsTab(_) => "SettingsTab",
+            Self::Running(_) => "Running([REDACTED])",
             Self::Back => "Back",
             Self::PrimarySsid(_) => "PrimarySsid([REDACTED])",
             Self::Username(_) => "Username([REDACTED])",
@@ -392,6 +410,10 @@ impl fmt::Debug for Message {
 }
 struct App {
     page: Page,
+    return_page: Page,
+    settings_tab: SettingsTab,
+    running: running_panel::State,
+    running_saved: RunningSettings,
     snapshot: Snapshot,
     startup_error: Option<String>,
     logs: VecDeque<String>,
@@ -504,6 +526,54 @@ impl App {
         }
         ok
     }
+    fn platform_login(&mut self) {
+        if self.preview {
+            self.running.platform.notice = Some(("离线预览不连接校园跑平台".into(), true));
+            return;
+        }
+        if self.running.platform.busy || self.startup_error.is_some() {
+            return;
+        }
+        let phone = self.running.prefs.phone.trim().to_owned();
+        let password = self.running.prefs.password.clone();
+        if phone.is_empty() || password.is_empty() {
+            self.running.platform.notice =
+                Some(("请先在校园跑设置中填写手机号和密码".into(), true));
+            return;
+        }
+        if self.send(Command::RunPlatformLogin {
+            phone,
+            password,
+            contract: Box::new(self.running.prefs.platform_contract()),
+        }) {
+            self.running.platform.busy = true;
+            self.running.platform.notice = Some(("正在登录校园跑平台…".into(), false));
+        }
+    }
+    fn platform_submit(&mut self) {
+        if self.preview {
+            self.running.platform.notice = Some(("离线预览不连接校园跑平台".into(), true));
+            return;
+        }
+        if self.running.platform.busy || self.startup_error.is_some() {
+            return;
+        }
+        if !self.running.platform.logged_in {
+            self.running.platform.notice = Some(("请先登录校园跑平台".into(), true));
+            return;
+        }
+        let Some((campus_id, preview)) = self.running.submission() else {
+            self.running.platform.notice = Some(("请先生成最新的路线预览".into(), true));
+            return;
+        };
+        if self.send(Command::RunPlatformSubmit {
+            campus_id,
+            preview: Box::new(preview),
+        }) {
+            self.running.platform.busy = true;
+            self.running.platform.notice = Some(("正在提交运动记录…".into(), false));
+        }
+    }
     fn log(&mut self, text: String) {
         if self.logs.len() == 200 {
             self.logs.pop_front();
@@ -549,6 +619,15 @@ impl App {
         }
         patch
     }
+    fn running_exit_patch(&self) -> RunningPatch {
+        let mut patch = self.running.prefs.patch_against(&self.running_saved);
+        if let Some(pending) = &self.saving {
+            let inflight = self.running.prefs.patch_against(&pending.running_settings);
+            macro_rules! merge { ($($field:ident),+) => { $(if patch.$field.is_none() { patch.$field = inflight.$field; })+ }; }
+            merge!(phone, password, default_campus, catalog_file);
+        }
+        patch
+    }
     fn prepare_exit_plan(&mut self) -> Result<shutdown::Plan> {
         let overrides = self.form.prepared_overrides(
             &self.overrides,
@@ -561,8 +640,13 @@ impl App {
         if !patch.is_empty() {
             self.form.validate_primary(&self.effective)?;
         }
+        let running = self.running_exit_patch();
+        if !running.is_empty() {
+            self.running.prefs.validate()?;
+        }
         Ok(shutdown::Plan {
             primary: (!patch.is_empty()).then_some((patch, primary_settings)),
+            running: (!running.is_empty()).then_some((running, self.running.prefs.clone())),
             overrides: (self.autosave.is_dirty() || self.pending || self.saving.is_some())
                 .then_some(overrides),
             autostart: self.autostart_intent,
@@ -577,6 +661,7 @@ impl App {
         self.exit_plan = Some(plan.clone());
         let (receiver, thread) = shutdown::launch(
             self.worker.take(),
+            self.running.take_job(),
             plan,
             self.preview,
             self.config_path.clone(),
@@ -599,6 +684,11 @@ impl App {
                 && let Some(overrides) = plan.overrides
             {
                 self.apply_saved_overrides(overrides);
+            }
+            if outcome.running_saved
+                && let Some((_, settings)) = plan.running
+            {
+                self.running_saved = settings;
             }
         }
         if let Some((enabled, generation)) = outcome.autostart {
@@ -656,14 +746,23 @@ impl App {
         };
         let primary_settings = self.form.primary_settings();
         let primary_patch = primary_settings.patch_against(&self.primary_saved);
+        let running_settings = self.running.prefs.clone();
+        let running_patch = running_settings.patch_against(&self.running_saved);
         if !primary_patch.is_empty()
             && let Err(error) = self.form.validate_primary(&self.effective)
         {
             self.finish_save(false, &format!("主网络尚未保存：{error:#}"));
             return;
         }
+        if !running_patch.is_empty()
+            && let Err(error) = running_settings.validate()
+        {
+            self.finish_save(false, &format!("校园跑设置尚未保存：{error}"));
+            return;
+        }
         if self.preview {
             self.primary_saved = primary_settings;
+            self.running_saved = running_settings;
             self.apply_saved_overrides(overrides);
             if let Some((enabled, generation)) = self.autostart_intent {
                 self.acknowledge_autostart(enabled, generation);
@@ -671,7 +770,11 @@ impl App {
             self.finish_save(true, "已自动保留预览设置，未写入文件或修改自启");
         } else {
             let command = if primary_patch.is_empty() {
-                Command::Settings(Box::new(overrides.clone()))
+                if running_patch.is_empty() {
+                    Command::Settings(Box::new(overrides.clone()))
+                } else {
+                    Command::RunningSettings(Box::new(running_patch), self.config_path.clone())
+                }
             } else {
                 Command::PrimarySettings(Box::new(primary_patch), self.config_path.clone())
             };
@@ -680,6 +783,7 @@ impl App {
                 self.saving = Some(PendingSave {
                     overrides,
                     primary_settings,
+                    running_settings,
                     autostart: self.autostart_intent,
                     revision,
                 });
@@ -708,6 +812,7 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => return Task::none(),
                 Err(mpsc::TryRecvError::Disconnected) => shutdown::Outcome {
                     primary_saved: false,
+                    running_saved: false,
                     settings_saved: false,
                     autostart: None,
                     error: Some("退出保存线程意外结束；请重试，或明确放弃修改退出".into()),
@@ -715,6 +820,7 @@ impl App {
             };
             return self.finish_shutdown(outcome);
         }
+        self.running.poll();
         let mut events = Vec::new();
         let mut disconnected = false;
         if let Some(worker) = &self.worker {
@@ -756,6 +862,11 @@ impl App {
                 Event::PrimarySettingsSaved(ok, warning) => {
                     self.primary_settings_saved(ok, warning)
                 }
+                Event::RunningSettingsSaved(ok, warning) => {
+                    self.running_settings_saved(ok, warning)
+                }
+                Event::RunPlatformLogin(result) => self.running.platform_login_done(result),
+                Event::RunPlatformSubmit(result) => self.running.platform_submit_done(result),
             }
         }
         if self
@@ -875,10 +986,40 @@ impl App {
         // 只更新磁盘基线，不改变运行中 Engine 的认证和 WiFi 配置。
         self.primary_saved = pending.primary_settings.clone();
         self.save_warning = warning;
+        self.save_running_or_overrides();
+    }
+    fn save_running_or_overrides(&mut self) {
+        let Some(pending) = &self.saving else {
+            return;
+        };
+        let patch = pending.running_settings.patch_against(&self.running_saved);
+        let command = if patch.is_empty() {
+            Command::Settings(Box::new(pending.overrides.clone()))
+        } else {
+            Command::RunningSettings(Box::new(patch), self.config_path.clone())
+        };
+        if !self.send(command) {
+            self.saving = None;
+            self.finish_save(false, "后续设置尚未保存，请重试");
+        }
+    }
+    fn running_settings_saved(&mut self, success: bool, warning: Option<&'static str>) {
+        let Some(pending) = &self.saving else {
+            return;
+        };
+        if !success {
+            self.saving = None;
+            self.finish_save(false, "校园跑设置尚未保存，请检查输入；草稿已保留");
+            return;
+        }
+        self.running_saved = pending.running_settings.clone();
+        if self.save_warning.is_none() {
+            self.save_warning = warning;
+        }
         let overrides = pending.overrides.clone();
         if !self.send(Command::Settings(Box::new(overrides))) {
             self.saving = None;
-            self.finish_save(false, "主网络已保存，界面设置保存失败；请重试");
+            self.finish_save(false, "校园跑设置已保存，界面设置尚未保存；请重试");
         }
     }
     fn autostart_saved(&mut self, enabled: bool) {
@@ -952,6 +1093,9 @@ impl App {
                         self.overrides.clone(),
                         self.start_paused,
                     ));
+                    if !self.running.prefs.catalog_file.is_empty() {
+                        self.running.load_catalog(false);
+                    }
                 }
                 let tasks = Task::batch([
                     window::scale_factor(id).map(Message::Scale),
@@ -988,10 +1132,46 @@ impl App {
             }
             Message::IconsReady => return Task::none(),
             Message::OpenSettings => {
+                if self.page != Page::Settings {
+                    self.return_page = self.page;
+                    self.settings_tab = if self.page == Page::Running {
+                        SettingsTab::Running
+                    } else {
+                        SettingsTab::Network
+                    };
+                }
                 self.page = Page::Settings;
             }
-            Message::Back => {
+            Message::OpenHome => {
                 self.page = Page::Home;
+                self.running.password_visible = false;
+            }
+            Message::OpenRunning => {
+                self.page = Page::Running;
+                self.form.password_visible = false;
+                self.form.account_password_visible = false;
+            }
+            Message::SettingsTab(tab) => {
+                self.settings_tab = tab;
+                self.running.password_visible = false;
+                self.form.password_visible = false;
+                self.form.account_password_visible = false;
+            }
+            Message::Running(message) => {
+                match message {
+                    running_panel::Message::PlatformLogin => self.platform_login(),
+                    running_panel::Message::PlatformSubmit => self.platform_submit(),
+                    other => {
+                        if self.running.handle(other, self.preview) {
+                            self.edited();
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Message::Back => {
+                self.page = self.return_page;
+                self.running.password_visible = false;
                 self.form.password_visible = false;
                 self.form.account_password_visible = false;
                 let now = Instant::now();
@@ -1149,6 +1329,7 @@ impl App {
                 if self.discard_on_exit {
                     self.begin_shutdown(shutdown::Plan {
                         primary: None,
+                        running: None,
                         overrides: None,
                         autostart: None,
                     });
@@ -1281,6 +1462,16 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool
     form.display_scale = display_scale;
     let app = App {
         page: Page::Home,
+        return_page: Page::Home,
+        settings_tab: SettingsTab::Global,
+        running: running_panel::State::new(
+            base.running.clone(),
+            config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+        ),
+        running_saved: base.running.clone(),
         form,
         snapshot,
         startup_error,
@@ -1380,6 +1571,10 @@ mod tests {
         let cached_theme = appearance::theme(&appearance, false);
         App {
             page: Page::Settings,
+            return_page: Page::Home,
+            settings_tab: SettingsTab::Global,
+            running: running_panel::State::new(base.running.clone(), PathBuf::from(".")),
+            running_saved: base.running.clone(),
             snapshot: Snapshot::default(),
             startup_error: Some("合成测试配置".into()),
             logs: VecDeque::new(),
@@ -1439,6 +1634,7 @@ mod tests {
         app.saving = Some(PendingSave {
             overrides,
             primary_settings: app.form.primary_settings(),
+            running_settings: app.running.prefs.clone(),
             autostart: app.autostart_intent,
             revision,
         });
@@ -1458,6 +1654,59 @@ mod tests {
         app
     }
 
+    #[test]
+    fn running_settings_ack_and_exit_preserve_latest_draft_and_reverts() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Running(running_panel::Message::Password(
+            "first-synthetic".into(),
+        )));
+        stage_save(&mut app);
+        let _ = app.update(Message::Running(running_panel::Message::Password(
+            "latest-synthetic".into(),
+        )));
+        app.running_settings_saved(true, None);
+        assert_eq!(app.running_saved.password, "first-synthetic");
+        assert_eq!(app.running.prefs.password, "latest-synthetic");
+        assert!(app.autosave.is_dirty());
+        let plan = app.prepare_exit_plan().unwrap();
+        assert_eq!(
+            plan.running.unwrap().0.password.as_deref(),
+            Some("latest-synthetic")
+        );
+        assert!(plan.primary.is_none());
+        assert!(plan.autostart.is_none());
+        assert_eq!(app.base.running.password, "");
+    }
+    #[test]
+    fn preview_mode_rejects_platform_commands_without_network() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Running(running_panel::Message::PlatformLogin));
+        assert!(!app.running.platform.busy);
+        assert_eq!(
+            app.running.platform.notice,
+            Some(("离线预览不连接校园跑平台".into(), true))
+        );
+        let _ = app.update(Message::Running(running_panel::Message::PlatformSubmit));
+        assert!(!app.running.platform.busy);
+        assert!(!app.running.platform.logged_in);
+    }
+    #[test]
+    fn settings_return_to_running_and_categories_preserve_drafts() {
+        let mut app = offline_app();
+        let _ = app.update(Message::OpenRunning);
+        let _ = app.update(Message::OpenSettings);
+        assert!(app.settings_tab == SettingsTab::Running);
+        let _ = app.update(Message::Running(running_panel::Message::Distance(
+            "2700".into(),
+        )));
+        let _ = app.update(Message::SettingsTab(SettingsTab::Global));
+        let _ = app.update(Message::SettingsTab(SettingsTab::Network));
+        let _ = app.update(Message::SettingsTab(SettingsTab::Running));
+        let _ = app.update(Message::Back);
+        assert!(app.page == Page::Running);
+        assert_eq!(app.running.distance, "2700");
+        assert!(app.worker.is_none());
+    }
     #[test]
     fn display_scale_changes_preview_immediately_and_autosaves_without_network() {
         let mut app = valid_primary_app();
@@ -1660,6 +1909,7 @@ mod tests {
                 *stored.borrow_mut() = "Older_Synthetic_WiFi".into();
             },
             |_| panic!("仅修改备用网络不得写主网络"),
+            |_| panic!("仅修改备用网络不得写校园跑设置"),
             |overrides| {
                 *stored.borrow_mut() = overrides.fallback_ssid.clone().unwrap();
                 Ok(())
@@ -1681,6 +1931,7 @@ mod tests {
         app.exit_plan = Some(app.prepare_exit_plan().unwrap());
         let _ = app.finish_shutdown(shutdown::Outcome {
             primary_saved: false,
+            running_saved: false,
             settings_saved: false,
             autostart: None,
             error: Some("合成保存失败".into()),

@@ -46,11 +46,12 @@ if (-not $?) { throw "第三方许可证收集失败" }
 # 明确的白名单，绝不复制本地 config.yaml / gui_settings.json / 日志 / HAR。
 Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageFolder "CUIT Helper.exe") -Force
 Copy-Item -LiteralPath "config.example.yaml" -Destination $stageFolder -Force
+Copy-Item -LiteralPath "config.routes.example.json" -Destination $stageFolder -Force
 Copy-Item -LiteralPath "README.md" -Destination $stageFolder -Force
 if (-not (Test-Path -LiteralPath "LICENSE")) { throw "缺少 LICENSE，停止发布" }
 Copy-Item -LiteralPath "LICENSE" -Destination $stageFolder -Force
 Copy-Item -LiteralPath "output\THIRD_PARTY_NOTICES.txt" -Destination $stageFolder -Force
-$expectedFiles = @("CUIT Helper.exe", "config.example.yaml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt")
+$expectedFiles = @("CUIT Helper.exe", "config.example.yaml", "config.routes.example.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt")
 $unexpectedFiles = @(Get-ChildItem -LiteralPath $stageFolder -Force | Where-Object { $_.Name -notin $expectedFiles -or $_.PSIsContainer })
 if ($unexpectedFiles.Count) { throw "打包目录含有非白名单文件，停止发布：$($unexpectedFiles.Name -join ', ')" }
 $zipPath = Join-Path $releaseFolder "$packageName.zip"

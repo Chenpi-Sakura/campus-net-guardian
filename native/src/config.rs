@@ -19,6 +19,379 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub logging: LoggingConfig,
     pub env_overrides: BTreeMap<String, String>,
+    /// 校园跑账号、默认路线与平台接入的本机 YAML 配置。
+    pub running: RunningSettings,
+}
+
+/// 校园跑账号、默认赛道与平台接入设置，仅保存在本机主 YAML 中。
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct RunningSettings {
+    /// 校园跑账号手机号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub phone: String,
+    /// 校园跑账号密码，保留原始空格。
+    pub password: String,
+    /// 默认校园 ID。
+    pub default_campus: String,
+    /// 赛道目录文件路径。
+    pub catalog_file: String,
+    /// 平台服务根地址，必须为 https；留空表示未配置平台接入。
+    #[serde(deserialize_with = "scalar_string")]
+    pub base_url: String,
+    /// 平台客户端 appkey。
+    #[serde(deserialize_with = "scalar_string")]
+    pub app_key: String,
+    /// 平台请求签名密钥。
+    pub app_secret: String,
+    /// 平台学校 ID。
+    #[serde(deserialize_with = "scalar_string")]
+    pub school_id: String,
+    /// 上报的客户端版本号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub app_version: String,
+    /// 上报的手机品牌。
+    #[serde(deserialize_with = "scalar_string")]
+    pub brand: String,
+    /// 上报的手机型号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub mobile_type: String,
+    /// 上报的手机系统版本。
+    #[serde(deserialize_with = "scalar_string")]
+    pub sys_version: String,
+    /// 上报的设备类型标识。
+    #[serde(deserialize_with = "scalar_string")]
+    pub device_type: String,
+    /// 上报的设备推送令牌，可为空。
+    #[serde(deserialize_with = "scalar_string")]
+    pub device_token: String,
+}
+
+impl Default for RunningSettings {
+    fn default() -> Self {
+        Self {
+            phone: String::new(),
+            password: String::new(),
+            default_campus: "demo-a".into(),
+            catalog_file: String::new(),
+            base_url: String::new(),
+            app_key: String::new(),
+            app_secret: String::new(),
+            school_id: String::new(),
+            app_version: "1.8.0".into(),
+            brand: String::new(),
+            mobile_type: String::new(),
+            sys_version: String::new(),
+            device_type: "1".into(),
+            device_token: String::new(),
+        }
+    }
+}
+
+impl RunningSettings {
+    /// 校验校园跑设置，不在错误中包含字段值。
+    pub fn validate(&self) -> Result<()> {
+        if !self.phone.is_empty()
+            && (self.phone.len() != 11 || !self.phone.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            bail!("校园跑手机号必须为空或 11 位 ASCII 数字");
+        }
+        if self.password.len() > 1024 || self.password.contains('\0') {
+            bail!("校园跑密码长度或字符无效");
+        }
+        if self.default_campus.is_empty()
+            || self.default_campus.len() > 64
+            || !self
+                .default_campus
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("默认校园 ID 格式无效");
+        }
+        if self.catalog_file.chars().count() > 4096
+            || self.catalog_file.contains(['\0', '\r', '\n'])
+            || self.catalog_file.starts_with(r"\\")
+            || self.catalog_file.starts_with("//")
+        {
+            bail!("赛道目录文件路径长度或字符无效");
+        }
+        self.platform_contract().validate()
+    }
+
+    /// 提取平台客户端契约视图；字段仍统一保存在 running 段。
+    pub fn platform_contract(&self) -> RunningPlatformConfig {
+        RunningPlatformConfig {
+            base_url: self.base_url.clone(),
+            app_key: self.app_key.clone(),
+            app_secret: self.app_secret.clone(),
+            school_id: self.school_id.clone(),
+            app_version: self.app_version.clone(),
+            brand: self.brand.clone(),
+            mobile_type: self.mobile_type.clone(),
+            sys_version: self.sys_version.clone(),
+            device_type: self.device_type.clone(),
+            device_token: self.device_token.clone(),
+        }
+    }
+
+    /// 仅生成相对上一草稿发生变化的校园跑字段。
+    pub fn patch_against(&self, previous: &Self) -> RunningPatch {
+        let changed =
+            |current: &String, prior: &String| (current != prior).then(|| current.clone());
+        RunningPatch {
+            phone: changed(&self.phone, &previous.phone),
+            password: changed(&self.password, &previous.password),
+            default_campus: changed(&self.default_campus, &previous.default_campus),
+            catalog_file: changed(&self.catalog_file, &previous.catalog_file),
+            base_url: changed(&self.base_url, &previous.base_url),
+            app_key: changed(&self.app_key, &previous.app_key),
+            app_secret: changed(&self.app_secret, &previous.app_secret),
+            school_id: changed(&self.school_id, &previous.school_id),
+            app_version: changed(&self.app_version, &previous.app_version),
+            brand: changed(&self.brand, &previous.brand),
+            mobile_type: changed(&self.mobile_type, &previous.mobile_type),
+            sys_version: changed(&self.sys_version, &previous.sys_version),
+            device_type: changed(&self.device_type, &previous.device_type),
+            device_token: changed(&self.device_token, &previous.device_token),
+        }
+    }
+}
+
+/// 校园跑 YAML 字段白名单；不实现 Debug 或 Serialize，避免凭据意外外泄。
+#[derive(Clone, Default)]
+pub struct RunningPatch {
+    /// 修改手机号。
+    pub phone: Option<String>,
+    /// 修改密码。
+    pub password: Option<String>,
+    /// 修改默认校园 ID。
+    pub default_campus: Option<String>,
+    /// 修改赛道目录文件路径。
+    pub catalog_file: Option<String>,
+    /// 修改平台服务根地址。
+    pub base_url: Option<String>,
+    /// 修改平台 appkey。
+    pub app_key: Option<String>,
+    /// 修改平台签名密钥。
+    pub app_secret: Option<String>,
+    /// 修改平台学校 ID。
+    pub school_id: Option<String>,
+    /// 修改上报客户端版本号。
+    pub app_version: Option<String>,
+    /// 修改上报手机品牌。
+    pub brand: Option<String>,
+    /// 修改上报手机型号。
+    pub mobile_type: Option<String>,
+    /// 修改上报手机系统版本。
+    pub sys_version: Option<String>,
+    /// 修改上报设备类型。
+    pub device_type: Option<String>,
+    /// 修改上报设备推送令牌。
+    pub device_token: Option<String>,
+}
+
+impl RunningPatch {
+    /// 判断是否没有明确修改的字段。
+    pub fn is_empty(&self) -> bool {
+        self.phone.is_none()
+            && self.password.is_none()
+            && self.default_campus.is_none()
+            && self.catalog_file.is_none()
+            && self.base_url.is_none()
+            && self.app_key.is_none()
+            && self.app_secret.is_none()
+            && self.school_id.is_none()
+            && self.app_version.is_none()
+            && self.brand.is_none()
+            && self.mobile_type.is_none()
+            && self.sys_version.is_none()
+            && self.device_type.is_none()
+            && self.device_token.is_none()
+    }
+
+    /// 合并最新 YAML 中的校园跑白名单字段并原子写回。
+    pub fn save_to(&self, path: &Path) -> Result<PrimarySaveOutcome> {
+        if self.is_empty() {
+            return Ok(PrimarySaveOutcome::default());
+        }
+        let target = fs::canonicalize(path).map_err(|_| anyhow::anyhow!("无法读取配置文件"))?;
+        let original =
+            fs::read_to_string(&target).map_err(|_| anyhow::anyhow!("无法读取配置文件"))?;
+        let mut document: serde_json::Value = serde_saphyr::from_str_with_options(
+            &original,
+            serde_saphyr::options! { no_schema: true },
+        )
+        .map_err(|_| anyhow::anyhow!("配置格式无效，请先修正 YAML 格式"))?;
+        let typed: AppConfig = serde_saphyr::from_str(&original)
+            .map_err(|_| anyhow::anyhow!("配置格式无效，请检查 YAML 字段与类型"))?;
+        restore_known_string_values(&mut document, &typed);
+        let running = RunningSettings {
+            phone: self.phone.clone().unwrap_or(typed.running.phone),
+            password: self.password.clone().unwrap_or(typed.running.password),
+            default_campus: self
+                .default_campus
+                .clone()
+                .unwrap_or(typed.running.default_campus),
+            catalog_file: self
+                .catalog_file
+                .clone()
+                .unwrap_or(typed.running.catalog_file),
+            base_url: self.base_url.clone().unwrap_or(typed.running.base_url),
+            app_key: self.app_key.clone().unwrap_or(typed.running.app_key),
+            app_secret: self.app_secret.clone().unwrap_or(typed.running.app_secret),
+            school_id: self.school_id.clone().unwrap_or(typed.running.school_id),
+            app_version: self
+                .app_version
+                .clone()
+                .unwrap_or(typed.running.app_version),
+            brand: self.brand.clone().unwrap_or(typed.running.brand),
+            mobile_type: self
+                .mobile_type
+                .clone()
+                .unwrap_or(typed.running.mobile_type),
+            sys_version: self
+                .sys_version
+                .clone()
+                .unwrap_or(typed.running.sys_version),
+            device_type: self
+                .device_type
+                .clone()
+                .unwrap_or(typed.running.device_type),
+            device_token: self
+                .device_token
+                .clone()
+                .unwrap_or(typed.running.device_token),
+        };
+        running.validate()?;
+        let root = document
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("配置顶层必须是 YAML 映射"))?;
+        let section = root
+            .entry("running")
+            .or_insert_with(|| serde_json::json!({}));
+        if section.is_null() {
+            *section = serde_json::json!({});
+        }
+        let section = section
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("校园跑配置必须是 YAML 映射"))?;
+        for (name, value) in [
+            ("phone", &running.phone),
+            ("password", &running.password),
+            ("default_campus", &running.default_campus),
+            ("catalog_file", &running.catalog_file),
+            ("base_url", &running.base_url),
+            ("app_key", &running.app_key),
+            ("app_secret", &running.app_secret),
+            ("school_id", &running.school_id),
+            ("app_version", &running.app_version),
+            ("brand", &running.brand),
+            ("mobile_type", &running.mobile_type),
+            ("sys_version", &running.sys_version),
+            ("device_type", &running.device_type),
+            ("device_token", &running.device_token),
+        ] {
+            section.insert(name.into(), serde_json::Value::String(value.clone()));
+        }
+        let serialized =
+            serde_saphyr::to_string(&document).map_err(|_| anyhow::anyhow!("无法生成配置文件"))?;
+        let parsed: AppConfig = serde_saphyr::from_str(&serialized)
+            .map_err(|_| anyhow::anyhow!("配置格式无效，请检查 YAML 字段与类型"))?;
+        parsed.running.validate()?;
+        write_primary_atomic(&target, &original, serialized.as_bytes())
+    }
+}
+
+/// 平台客户端契约视图，由 RunningSettings 提取；不实现 Debug 或 Serialize，避免密钥外泄。
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunningPlatformConfig {
+    /// 平台服务根地址，必须为 https；留空表示未配置平台接入。
+    pub base_url: String,
+    /// 平台客户端 appkey。
+    pub app_key: String,
+    /// 平台请求签名密钥。
+    pub app_secret: String,
+    /// 平台学校 ID。
+    pub school_id: String,
+    /// 上报的客户端版本号。
+    pub app_version: String,
+    /// 上报的手机品牌。
+    pub brand: String,
+    /// 上报的手机型号。
+    pub mobile_type: String,
+    /// 上报的手机系统版本。
+    pub sys_version: String,
+    /// 上报的设备类型标识。
+    pub device_type: String,
+    /// 上报的设备推送令牌，可为空。
+    pub device_token: String,
+}
+
+impl Default for RunningPlatformConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            app_key: String::new(),
+            app_secret: String::new(),
+            school_id: String::new(),
+            app_version: "1.8.0".into(),
+            brand: String::new(),
+            mobile_type: String::new(),
+            sys_version: String::new(),
+            device_type: "1".into(),
+            device_token: String::new(),
+        }
+    }
+}
+
+impl RunningPlatformConfig {
+    /// 是否填写了平台服务地址；未配置时平台功能整体禁用。
+    pub fn configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
+    }
+
+    /// 校验平台契约，不在错误中包含字段值；未配置视为合法。
+    pub fn validate(&self) -> Result<()> {
+        if !self.configured() {
+            return Ok(());
+        }
+        let url = url::Url::parse(self.base_url.trim())
+            .map_err(|_| anyhow::anyhow!("平台服务地址无效"))?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            bail!("平台服务地址必须为 https，且不得内嵌账密");
+        }
+        for value in [&self.app_key, &self.app_secret] {
+            if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_graphic())
+            {
+                bail!("平台 appkey 或签名密钥缺失或格式无效");
+            }
+        }
+        if self.school_id.is_empty()
+            || self.school_id.len() > 16
+            || !self.school_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            bail!("平台学校 ID 必须为数字");
+        }
+        for value in [&self.brand, &self.mobile_type, &self.sys_version] {
+            if value.trim().is_empty() || value.len() > 128 || value.contains(['\0', '\r', '\n']) {
+                bail!("平台手机品牌、型号与系统版本必须填写");
+            }
+        }
+        if self.app_version.trim().is_empty() || self.app_version.len() > 32 {
+            bail!("平台客户端版本号无效");
+        }
+        if self.device_type.trim().is_empty() || self.device_type.len() > 8 {
+            bail!("平台设备类型无效");
+        }
+        if self.device_token.len() > 256 || self.device_token.contains(['\0', '\r', '\n']) {
+            bail!("平台设备令牌长度或字符无效");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -527,6 +900,20 @@ fn restore_known_string_values(document: &mut serde_json::Value, original: &AppC
         ("/wifi/fallback/auth", &original.wifi.fallback.auth),
         ("/logging/file", &original.logging.file),
         ("/logging/level", &original.logging.level),
+        ("/running/phone", &original.running.phone),
+        ("/running/password", &original.running.password),
+        ("/running/default_campus", &original.running.default_campus),
+        ("/running/catalog_file", &original.running.catalog_file),
+        ("/running/base_url", &original.running.base_url),
+        ("/running/app_key", &original.running.app_key),
+        ("/running/app_secret", &original.running.app_secret),
+        ("/running/school_id", &original.running.school_id),
+        ("/running/app_version", &original.running.app_version),
+        ("/running/brand", &original.running.brand),
+        ("/running/mobile_type", &original.running.mobile_type),
+        ("/running/sys_version", &original.running.sys_version),
+        ("/running/device_type", &original.running.device_type),
+        ("/running/device_token", &original.running.device_token),
     ] {
         if let Some(current) = document.pointer_mut(path)
             && !current.is_string()
@@ -1915,5 +2302,177 @@ env_overrides: {}
         assert!(value.get("portal").is_none());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn running_settings_defaults_roundtrip_and_preserve_other_yaml_fields() {
+        let legacy = PRIMARY_YAML;
+        let old: AppConfig = serde_saphyr::from_str(legacy).unwrap();
+        assert!(old.running == RunningSettings::default());
+        let yaml = format!(
+            "{legacy}\nrunning:\n  phone: 12345678901\n  password: ' synthetic pass '\n  default_campus: campus_1\n  catalog_file: tracks.yaml\n"
+        );
+        let loaded: AppConfig = serde_saphyr::from_str(&yaml).unwrap();
+        assert_eq!(loaded.running.phone, "12345678901");
+        assert_eq!(loaded.running.password, " synthetic pass ");
+        loaded.running.validate().unwrap();
+        with_primary_yaml(legacy, |path| {
+            RunningPatch {
+                phone: Some("12345678901".into()),
+                password: Some(" synthetic pass ".into()),
+                default_campus: Some("campus_1".into()),
+                catalog_file: Some("tracks.yaml".into()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(saved.running == loaded.running);
+            assert_eq!(saved.wifi.ssid, "Synthetic_Campus_WiFi");
+            assert_eq!(saved.account.username, "synthetic-user");
+            let actual: serde_json::Value =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            let expected: serde_json::Value = serde_saphyr::from_str(legacy).unwrap();
+            assert_eq!(actual["unknown"], expected["unknown"]);
+        });
+        let json = serde_json::to_value(GuiOverrides::default()).unwrap();
+        assert!(json.get("running").is_none());
+        assert!(json.get("phone").is_none());
+        assert!(json.get("password").is_none());
+    }
+
+    #[test]
+    fn running_invalid_patch_does_not_modify_yaml() {
+        for patch in [
+            RunningPatch {
+                phone: Some("123".into()),
+                ..Default::default()
+            },
+            RunningPatch {
+                default_campus: Some("bad campus".into()),
+                ..Default::default()
+            },
+            RunningPatch {
+                password: Some("bad\0password".into()),
+                ..Default::default()
+            },
+        ] {
+            with_primary_yaml(PRIMARY_YAML, |path| {
+                let before = fs::read(path).unwrap();
+                assert!(patch.save_to(path).is_err());
+                assert_eq!(fs::read(path).unwrap(), before);
+            });
+        }
+    }
+
+    #[test]
+    fn primary_patch_preserves_existing_running_fields() {
+        let yaml = format!(
+            "{PRIMARY_YAML}\nrunning:\n  phone: 12345678901\n  password: ' synthetic pass '\n  default_campus: campus_1\n  catalog_file: tracks.yaml\n"
+        );
+        with_primary_yaml(&yaml, |path| {
+            PrimaryPatch {
+                ssid: Some("Updated_Synthetic_WiFi".into()),
+                ..Default::default()
+            }
+            .save_to_with_env(path, |_| None)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.phone, "12345678901");
+            assert_eq!(saved.running.password, " synthetic pass ");
+            assert_eq!(saved.running.default_campus, "campus_1");
+            assert_eq!(saved.running.catalog_file, "tracks.yaml");
+        });
+    }
+
+    #[test]
+    fn running_platform_defaults_are_unconfigured_and_valid() {
+        let contract = RunningPlatformConfig::default();
+        assert!(!contract.configured());
+        assert!(contract.validate().is_ok());
+        assert_eq!(contract.app_version, "1.8.0");
+        assert_eq!(contract.device_type, "1");
+    }
+
+    #[test]
+    fn running_platform_contract_requires_https_and_complete_fields() {
+        let valid = RunningPlatformConfig {
+            base_url: "https://platform.test".into(),
+            app_key: "synthetic-key".into(),
+            app_secret: "synthetic-secret".into(),
+            school_id: "1000".into(),
+            brand: "SyntheticBrand".into(),
+            mobile_type: "SyntheticModel".into(),
+            sys_version: "14".into(),
+            ..Default::default()
+        };
+        assert!(valid.configured());
+        assert!(valid.validate().is_ok());
+        for mutate in [
+            |c: &mut RunningPlatformConfig| c.base_url = "http://platform.test".into(),
+            |c: &mut RunningPlatformConfig| c.base_url = "https://user:pass@platform.test".into(),
+            |c: &mut RunningPlatformConfig| c.app_secret.clear(),
+            |c: &mut RunningPlatformConfig| c.school_id = "12a".into(),
+            |c: &mut RunningPlatformConfig| c.brand.clear(),
+            |c: &mut RunningPlatformConfig| c.mobile_type = "bad\nmodel".into(),
+            |c: &mut RunningPlatformConfig| c.app_version.clear(),
+        ] {
+            let mut broken = valid.clone();
+            mutate(&mut broken);
+            assert!(broken.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn running_patch_preserves_platform_contract_and_scalar_school_id() {
+        let yaml = format!(
+            "{PRIMARY_YAML}\nrunning:\n  phone: ''\n  base_url: https://platform.test\n  app_key: synthetic-key\n  app_secret: synthetic-secret\n  school_id: 1000\n  brand: SyntheticBrand\n  mobile_type: SyntheticModel\n  sys_version: '14'\n"
+        );
+        with_primary_yaml(&yaml, |path| {
+            let loaded: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(loaded.running.school_id, "1000");
+            assert!(loaded.running.validate().is_ok());
+            RunningPatch {
+                phone: Some("12345678901".into()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.phone, "12345678901");
+            assert!(saved.running.platform_contract() == loaded.running.platform_contract());
+        });
+    }
+
+    #[test]
+    fn running_patch_saves_platform_fields_and_rejects_invalid_contract() {
+        let yaml = format!(
+            "{PRIMARY_YAML}\nrunning:\n  phone: ''\n  base_url: https://platform.test\n  app_key: synthetic-key\n  app_secret: synthetic-secret\n  school_id: 1000\n  brand: SyntheticBrand\n  mobile_type: SyntheticModel\n  sys_version: '14'\n"
+        );
+        with_primary_yaml(&yaml, |path| {
+            RunningPatch {
+                brand: Some("UpdatedBrand".into()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.brand, "UpdatedBrand");
+            let before = fs::read(path).unwrap();
+            assert!(
+                RunningPatch {
+                    base_url: Some("http://platform.test".into()),
+                    ..Default::default()
+                }
+                .save_to(path)
+                .is_err()
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
+        });
     }
 }
