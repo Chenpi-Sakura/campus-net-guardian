@@ -4,6 +4,11 @@ use crate::{
     auth::{AuthClient, AuthResult},
     config::{AppConfig, GuiOverrides, PrimaryPatch, RunningPatch},
     platform,
+    running::Preview,
+    running_platform::{
+        PlatformClient, PlatformLoginInfo, PlatformSubmitInfo, campus_projection, record_body,
+        track_points_json,
+    },
 };
 use anyhow::Result;
 use std::{
@@ -56,6 +61,16 @@ pub enum Command {
     PrimarySettings(Box<PrimaryPatch>, std::path::PathBuf),
     /// 串行持久化校园跑设置，不修改校园网守护状态。
     RunningSettings(Box<RunningPatch>, std::path::PathBuf),
+    /// 登录校园跑平台并获取运动规则；凭据来自界面最新草稿。
+    RunPlatformLogin {
+        phone: String,
+        password: String,
+    },
+    /// 提交本地预览生成的运动记录；需要先登录平台。
+    RunPlatformSubmit {
+        campus_id: String,
+        preview: Box<Preview>,
+    },
     Autostart(bool, std::path::PathBuf),
     ScanNetworks,
     Stop,
@@ -69,6 +84,10 @@ pub enum Event {
     PrimarySettingsSaved(bool, Option<&'static str>),
     /// 校园跑配置保存结果及不含敏感信息的清理提示。
     RunningSettingsSaved(bool, Option<&'static str>),
+    /// 校园跑平台登录结果；错误文本不含令牌与原始响应。
+    RunPlatformLogin(Result<PlatformLoginInfo, String>),
+    /// 校园跑记录提交结果；错误文本不含令牌与原始响应。
+    RunPlatformSubmit(Result<PlatformSubmitInfo, String>),
 }
 
 pub struct Worker {
@@ -132,6 +151,7 @@ fn run(
 ) {
     let mut engine = Engine::new(config, overrides, Instant::now(), start_paused);
     let mut backend = RealBackend(stop.clone());
+    let mut platform_session: Option<(PlatformClient, PlatformLoginInfo)> = None;
     engine.snapshot.autostart = platform::autostart_enabled();
     let log_config = std::cell::RefCell::new(engine.config.logging.clone());
     let mut emit = |event| {
@@ -262,6 +282,60 @@ fn run(
                             "校园跑设置保存失败，请检查配置文件与目录权限".into(),
                         ));
                         emit(Event::RunningSettingsSaved(false, None));
+                    }
+                }
+            }
+            Ok(Command::RunPlatformLogin { phone, password }) => {
+                // 平台会话独立于校园网守护；登录失败清除旧会话，避免使用失效令牌。
+                let result = (|| -> Result<(PlatformClient, PlatformLoginInfo)> {
+                    let mut client = PlatformClient::new(engine.config.running_platform.clone())?;
+                    let info = client.login(&phone, &password, &stop)?;
+                    Ok((client, info))
+                })();
+                match result {
+                    Ok((client, info)) => {
+                        emit(Event::Log("校园跑平台登录成功".into()));
+                        emit(Event::RunPlatformLogin(Ok(info.clone())));
+                        platform_session = Some((client, info));
+                    }
+                    Err(error) => {
+                        platform_session = None;
+                        emit(Event::Log("校园跑平台登录失败".into()));
+                        emit(Event::RunPlatformLogin(Err(error.to_string())));
+                    }
+                }
+            }
+            Ok(Command::RunPlatformSubmit { campus_id, preview }) => {
+                let result = (|| -> Result<PlatformSubmitInfo> {
+                    let (client, info) = platform_session
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("请先登录校园跑平台"))?;
+                    let projection = campus_projection(&campus_id)
+                        .ok_or_else(|| anyhow::anyhow!("此校区没有地理锚点，仅内置校区支持提交"))?;
+                    let now = SystemTime::now();
+                    let end_ms = now
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_err(|_| anyhow::anyhow!("系统时间异常"))?
+                        .as_millis() as u64;
+                    let track = track_points_json(
+                        &preview.points,
+                        preview.duration_seconds,
+                        &projection,
+                        end_ms,
+                        preview.seed,
+                    )?;
+                    let body =
+                        record_body(&engine.config.running_platform, info, &preview, &track, now)?;
+                    client.submit(&body, &stop)
+                })();
+                match result {
+                    Ok(info) => {
+                        emit(Event::Log("校园跑运动记录已提交".into()));
+                        emit(Event::RunPlatformSubmit(Ok(info)));
+                    }
+                    Err(error) => {
+                        emit(Event::Log("校园跑运动记录提交失败".into()));
+                        emit(Event::RunPlatformSubmit(Err(error.to_string())));
                     }
                 }
             }

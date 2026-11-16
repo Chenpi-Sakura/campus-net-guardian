@@ -1,5 +1,6 @@
 [
   {
+    "campus_id": "demo-a",
     "campus": "航空港校区",
     "osm_boundary": "https://www.openstreetmap.org/way/543945074",
     "api_source": "https://api.openstreetmap.org/api/0.6/map",
@@ -18,6 +19,7 @@
     ]
   },
   {
+    "campus_id": "demo-b",
     "campus": "龙泉校区",
     "osm_boundary": "https://www.openstreetmap.org/way/477890047",
     "api_source": "https://api.openstreetmap.org/api/0.6/map",

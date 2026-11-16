@@ -1071,6 +1071,10 @@ fn running_settings(app: &App, compact: bool) -> Element<'_, Message> {
             muted(
                 "留空使用航空港与龙泉校区底图；本次校区不会修改默认校区。",
                 11.0
+            ),
+            muted(
+                "平台接入参数在 config.yaml 的 running_platform 段配置，修改后重启生效。",
+                11.0
             )
         ]
         .spacing(10);
@@ -1280,9 +1284,51 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         .width(Fill)
         .padding([8, 12])
         .style(secondary);
+    let platform = &state.platform;
+    let platform_status = if app.preview {
+        "平台：离线预览不连接".to_owned()
+    } else if platform.busy {
+        "平台：请求进行中…".to_owned()
+    } else if platform.logged_in {
+        match &platform.semester {
+            Some(semester) => format!("平台：已登录 · 学期 {semester}"),
+            None => "平台：已登录".to_owned(),
+        }
+    } else {
+        "平台：未登录".to_owned()
+    };
+    let platform_login = button(centered("登录平台", 12.0))
+        .on_press_maybe(
+            (!app.preview && !platform.busy).then_some(Message::Running(RunMessage::PlatformLogin)),
+        )
+        .padding([6, 10])
+        .style(secondary);
+    let platform_submit = button(centered("提交记录", 12.0))
+        .on_press_maybe(
+            (!app.preview && platform.logged_in && !platform.busy && state.submission().is_some())
+                .then_some(Message::Running(RunMessage::PlatformSubmit)),
+        )
+        .padding([6, 10])
+        .style(primary);
+    let platform_buttons = row![platform_login, platform_submit].spacing(8);
+    let mut platform_area = if compact {
+        column![label(platform_status, 12.0), platform_buttons].spacing(6)
+    } else {
+        column![
+            row![label(platform_status, 12.0).width(Fill), platform_buttons]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(6)
+    };
+    if let Some((text, is_error)) = &platform.notice {
+        platform_area = platform_area.push(notice(text, *is_error));
+    }
     let plot_area = column![
         metrics,
-        muted("生成数据为本地模拟，不会提交运动记录。", 11.0)
+        line(),
+        platform_area,
+        muted("生成数据为本地模拟，点击提交记录后才会上传。", 11.0)
     ]
     .spacing(12)
     .width(Fill);

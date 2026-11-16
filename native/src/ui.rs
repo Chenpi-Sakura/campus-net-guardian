@@ -526,6 +526,50 @@ impl App {
         }
         ok
     }
+    fn platform_login(&mut self) {
+        if self.preview {
+            self.running.platform.notice = Some(("离线预览不连接校园跑平台".into(), true));
+            return;
+        }
+        if self.running.platform.busy || self.startup_error.is_some() {
+            return;
+        }
+        let phone = self.running.prefs.phone.trim().to_owned();
+        let password = self.running.prefs.password.clone();
+        if phone.is_empty() || password.is_empty() {
+            self.running.platform.notice =
+                Some(("请先在校园跑设置中填写手机号和密码".into(), true));
+            return;
+        }
+        if self.send(Command::RunPlatformLogin { phone, password }) {
+            self.running.platform.busy = true;
+            self.running.platform.notice = Some(("正在登录校园跑平台…".into(), false));
+        }
+    }
+    fn platform_submit(&mut self) {
+        if self.preview {
+            self.running.platform.notice = Some(("离线预览不连接校园跑平台".into(), true));
+            return;
+        }
+        if self.running.platform.busy || self.startup_error.is_some() {
+            return;
+        }
+        if !self.running.platform.logged_in {
+            self.running.platform.notice = Some(("请先登录校园跑平台".into(), true));
+            return;
+        }
+        let Some((campus_id, preview)) = self.running.submission() else {
+            self.running.platform.notice = Some(("请先生成最新的路线预览".into(), true));
+            return;
+        };
+        if self.send(Command::RunPlatformSubmit {
+            campus_id,
+            preview: Box::new(preview),
+        }) {
+            self.running.platform.busy = true;
+            self.running.platform.notice = Some(("正在提交运动记录…".into(), false));
+        }
+    }
     fn log(&mut self, text: String) {
         if self.logs.len() == 200 {
             self.logs.pop_front();
@@ -817,6 +861,8 @@ impl App {
                 Event::RunningSettingsSaved(ok, warning) => {
                     self.running_settings_saved(ok, warning)
                 }
+                Event::RunPlatformLogin(result) => self.running.platform_login_done(result),
+                Event::RunPlatformSubmit(result) => self.running.platform_submit_done(result),
             }
         }
         if self
@@ -1108,8 +1154,14 @@ impl App {
                 self.form.account_password_visible = false;
             }
             Message::Running(message) => {
-                if self.running.handle(message, self.preview) {
-                    self.edited();
+                match message {
+                    running_panel::Message::PlatformLogin => self.platform_login(),
+                    running_panel::Message::PlatformSubmit => self.platform_submit(),
+                    other => {
+                        if self.running.handle(other, self.preview) {
+                            self.edited();
+                        }
+                    }
                 }
                 return Task::none();
             }
@@ -1620,6 +1672,19 @@ mod tests {
         assert!(plan.primary.is_none());
         assert!(plan.autostart.is_none());
         assert_eq!(app.base.running.password, "");
+    }
+    #[test]
+    fn preview_mode_rejects_platform_commands_without_network() {
+        let mut app = offline_app();
+        let _ = app.update(Message::Running(running_panel::Message::PlatformLogin));
+        assert!(!app.running.platform.busy);
+        assert_eq!(
+            app.running.platform.notice,
+            Some(("离线预览不连接校园跑平台".into(), true))
+        );
+        let _ = app.update(Message::Running(running_panel::Message::PlatformSubmit));
+        assert!(!app.running.platform.busy);
+        assert!(!app.running.platform.logged_in);
     }
     #[test]
     fn settings_return_to_running_and_categories_preserve_drafts() {

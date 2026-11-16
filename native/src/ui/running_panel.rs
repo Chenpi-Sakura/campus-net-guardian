@@ -1,8 +1,9 @@
-//! 校园跑草稿和可取消的本地路线任务；不执行校园网操作或上传模拟记录。
+//! 校园跑草稿和可取消的本地路线任务；平台登录与提交由守护进程串行执行。
 use super::route_plot::Plot;
 use crate::{
     config::RunningSettings,
     running::{self, Catalog, GenerateRequest, Noise, Preview},
+    running_platform::{PlatformLoginInfo, PlatformSubmitInfo},
 };
 use anyhow::{Result, bail};
 use std::{
@@ -46,6 +47,8 @@ pub(super) enum Message {
     DefaultCampus(Choice),
     CatalogFile(String),
     LoadCatalog,
+    PlatformLogin,
+    PlatformSubmit,
 }
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,12 +68,22 @@ impl fmt::Debug for Message {
             Self::DefaultCampus(_) => "RunDefaultCampus",
             Self::CatalogFile(_) => "RunCatalogFile([REDACTED])",
             Self::LoadCatalog => "RunLoadCatalog",
+            Self::PlatformLogin => "RunPlatformLogin",
+            Self::PlatformSubmit => "RunPlatformSubmit",
         })
     }
 }
 enum Outcome {
     Preview(Box<Preview>),
     Catalog(Catalog),
+}
+/// 平台接入状态；网络请求由守护进程串行执行，这里只保存回执。
+#[derive(Clone, Default)]
+pub(super) struct PlatformState {
+    pub(super) busy: bool,
+    pub(super) logged_in: bool,
+    pub(super) semester: Option<String>,
+    pub(super) notice: Option<(String, bool)>,
 }
 pub(super) struct Job {
     cancel: Arc<AtomicBool>,
@@ -103,6 +116,7 @@ pub(super) struct State {
     pub(super) plot: Plot,
     pub(super) error: Option<String>,
     pub(super) status: Option<String>,
+    pub(super) platform: PlatformState,
     catalog: Catalog,
     campus_override: Option<String>,
     preset: Option<String>,
@@ -141,6 +155,7 @@ impl State {
             plot: Plot::default(),
             error,
             status: None,
+            platform: PlatformState::default(),
             catalog,
             campus_override: None,
             preset: Some("@track".into()),
@@ -242,6 +257,51 @@ impl State {
                 id: String::new(),
                 name: "校园内道路（随机）".into(),
             })
+    }
+    /// 可提交的最新预览；草稿过期或无预览时返回 None。
+    pub(super) fn submission(&self) -> Option<(String, Preview)> {
+        let preview = self.preview.as_ref()?;
+        if self.preview_stale {
+            return None;
+        }
+        Some((self.active_id().to_owned(), preview.clone()))
+    }
+    /// 平台登录回执；失败时清除登录态。
+    pub(super) fn platform_login_done(&mut self, result: Result<PlatformLoginInfo, String>) {
+        self.platform.busy = false;
+        match result {
+            Ok(info) => {
+                self.platform.logged_in = true;
+                self.platform.semester =
+                    (!info.semester_year.is_empty()).then_some(info.semester_year);
+                self.platform.notice = Some(("已登录校园跑平台".into(), false));
+            }
+            Err(error) => {
+                self.platform.logged_in = false;
+                self.platform.semester = None;
+                self.platform.notice = Some((error, true));
+            }
+        }
+    }
+    /// 平台提交回执；展示平台返回的状态与警告。
+    pub(super) fn platform_submit_done(&mut self, result: Result<PlatformSubmitInfo, String>) {
+        self.platform.busy = false;
+        match result {
+            Ok(info) => {
+                let mut text = format!(
+                    "记录已提交：编号 {} · 状态 {}",
+                    info.record_id, info.result_status
+                );
+                if !info.result_desc.is_empty() {
+                    text.push_str(&format!(" · {}", info.result_desc));
+                }
+                if !info.warn_content.is_empty() {
+                    text.push_str(&format!(" · 警告：{}", info.warn_content));
+                }
+                self.platform.notice = Some((text, false));
+            }
+            Err(error) => self.platform.notice = Some((error, true)),
+        }
     }
     fn invalidate(&mut self, clear: bool) {
         self.work_revision = self.work_revision.wrapping_add(1);
@@ -564,6 +624,8 @@ impl State {
                 self.invalidate(false);
                 self.status = Some("已取消生成".into());
             }
+            // 平台命令由界面层转发守护进程，这里不改动草稿。
+            Message::PlatformLogin | Message::PlatformSubmit => {}
         }
         false
     }
@@ -710,5 +772,68 @@ mod tests {
         s.prefs.catalog_file = "synthetic-private.json".into();
         s.load_catalog(true);
         assert!(!s.busy());
+    }
+    #[test]
+    fn platform_login_receipt_updates_session_and_failure_clears_it() {
+        let mut s = state();
+        s.platform_login_done(Ok(PlatformLoginInfo {
+            user_id: 42,
+            semester_year: "2026-2027-1".into(),
+            site_bound: "synthetic-bound".into(),
+            once_time_min: 600,
+            once_time_max: 3600,
+        }));
+        assert!(!s.platform.busy);
+        assert!(s.platform.logged_in);
+        assert_eq!(s.platform.semester.as_deref(), Some("2026-2027-1"));
+        s.platform_login_done(Err("平台返回错误：合成失败".into()));
+        assert!(!s.platform.logged_in);
+        assert!(s.platform.semester.is_none());
+        assert_eq!(
+            s.platform.notice,
+            Some(("平台返回错误：合成失败".into(), true))
+        );
+    }
+    #[test]
+    fn submission_requires_fresh_preview_and_uses_active_campus() {
+        let mut s = state();
+        assert!(s.submission().is_none());
+        let catalog = running::demo_catalog();
+        let preview = running::generate(
+            &catalog.campuses[0],
+            &GenerateRequest {
+                preset_id: None,
+                distance_m: 1000,
+                duration_seconds: 600,
+                noise: Noise::Off,
+                seed: 1,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        s.preview = Some(preview);
+        let (campus_id, _) = s.submission().expect("新预览应可提交");
+        assert_eq!(campus_id, "demo-a");
+        s.handle(Message::Distance("2500".into()), true);
+        assert!(s.preview_stale);
+        assert!(s.submission().is_none());
+    }
+    #[test]
+    fn platform_submit_receipt_includes_platform_warnings() {
+        let mut s = state();
+        s.platform_submit_done(Ok(PlatformSubmitInfo {
+            record_id: 777,
+            result_status: "1".into(),
+            result_desc: "合成成功".into(),
+            over_speed_warn: "1".into(),
+            warn_content: "合成警告".into(),
+        }));
+        let (text, is_error) = s.platform.notice.clone().expect("应有提交回执");
+        assert!(!is_error);
+        assert!(text.contains("777"));
+        assert!(text.contains("合成成功"));
+        assert!(text.contains("合成警告"));
+        s.platform_submit_done(Err("请先登录校园跑平台".into()));
+        assert_eq!(s.platform.notice, Some(("请先登录校园跑平台".into(), true)));
     }
 }
