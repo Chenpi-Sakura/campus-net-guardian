@@ -131,7 +131,7 @@ impl State {
             password_visible: false,
             distance: distance.to_string(),
             minutes: minutes.to_string(),
-            noise: Noise::Strong,
+            noise: Noise::Medium,
             random_parameters: true,
             preview: None,
             map_preview: None,

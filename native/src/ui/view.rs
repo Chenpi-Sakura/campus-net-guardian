@@ -1129,14 +1129,31 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
     .text_size(13)
     .style(selection)
     .menu_style(menu);
-    let noise = pick_list(crate::running::Noise::ALL, Some(state.noise), |noise| {
-        Message::Running(RunMessage::Noise(noise))
-    })
-    .width(Fill)
-    .padding([7, 10])
-    .text_size(13)
-    .style(selection)
-    .menu_style(menu);
+    let mut noise = iced::widget::Row::new().spacing(3).width(Fill);
+    for &level in crate::running::Noise::ALL {
+        let control = button(centered(level, 12.0))
+            .width(Fill)
+            .padding([6, 4])
+            .on_press(Message::Running(RunMessage::Noise(level)))
+            .style(if state.noise == level {
+                primary
+            } else {
+                secondary
+            });
+        let hint = if level == crate::running::Noise::Off {
+            "不添加模拟偏移".into()
+        } else {
+            format!("最大模拟偏移：{} 米", level.max_offset_m())
+        };
+        noise = noise.push(
+            iced::widget::tooltip(
+                control,
+                label(hint, 12.0),
+                iced::widget::tooltip::Position::Top,
+            )
+            .style(surface),
+        );
+    }
     let distance = network_field(
         "目标距离（米）",
         "例如 2000",

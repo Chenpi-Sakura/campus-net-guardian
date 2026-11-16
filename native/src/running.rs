@@ -89,6 +89,15 @@ pub enum Noise {
     Strong,
 }
 impl Noise {
+    /// 此档位允许的最大本地模拟偏移，单位为米。
+    pub fn max_offset_m(self) -> f64 {
+        match self {
+            Self::Off => 0.0,
+            Self::Light => 5.0,
+            Self::Medium => 10.0,
+            Self::Strong => 20.0,
+        }
+    }
     /// 全部支持的扰动等级。
     pub const ALL: &'static [Self] = &[Self::Off, Self::Light, Self::Medium, Self::Strong];
 }
@@ -96,9 +105,9 @@ impl fmt::Display for Noise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Off => "关闭",
-            Self::Light => "轻微（本地模拟）",
-            Self::Medium => "中等（本地模拟）",
-            Self::Strong => "强（约20米）",
+            Self::Light => "弱",
+            Self::Medium => "中",
+            Self::Strong => "强",
         })
     }
 }
@@ -443,12 +452,7 @@ pub fn generate(
         bail!("达到行走步数上限仍未生成目标距离");
     }
     let reference = raw.clone();
-    let amplitude = match request.noise {
-        Noise::Off => 0.0,
-        Noise::Light => 0.8,
-        Noise::Medium => 3.0,
-        Noise::Strong => 20.0,
-    };
+    let amplitude = request.noise.max_offset_m();
     let phase = rng.unit() * std::f64::consts::TAU;
     let mut positions = vec![raw[0]];
     let mut along = 0.;
@@ -541,6 +545,13 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn noise_levels_match_requested_meter_limits() {
+        assert_eq!(Noise::Light.max_offset_m(), 5.0);
+        assert_eq!(Noise::Medium.max_offset_m(), 10.0);
+        assert_eq!(Noise::Strong.max_offset_m(), 20.0);
+        assert_eq!(Noise::Off.max_offset_m(), 0.0);
+    }
     #[test]
     fn strong_noise_is_visible_bounded_and_keeps_endpoints() {
         let campus = demo_catalog().campuses.remove(0);
