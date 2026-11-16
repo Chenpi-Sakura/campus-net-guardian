@@ -49,6 +49,29 @@ macro_rules! choices {
 choices!(IntervalChoice, u64, [15, 30, 60, 120], " 秒");
 choices!(ThresholdChoice, u32, [2, 3, 5], " 次");
 #[derive(Clone, Copy, PartialEq, Eq)]
+struct DisplayScaleChoice(u16);
+impl DisplayScaleChoice {
+    const ALL: &'static [Self] = &[
+        Self(50),
+        Self(67),
+        Self(90),
+        Self(100),
+        Self(110),
+        Self(125),
+        Self(150),
+        Self(200),
+    ];
+
+    fn factor(self) -> f32 {
+        f32::from(self.0) / 100.0
+    }
+}
+impl fmt::Display for DisplayScaleChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%", self.0)
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ServiceChoice {
     Mobile,
     Telecom,
@@ -120,6 +143,7 @@ struct Form {
     password_visible: bool,
     mode: ThemeMode,
     style: ThemeStyle,
+    display_scale: DisplayScaleChoice,
     accent: String,
     background: String,
     surface: String,
@@ -150,6 +174,7 @@ impl Form {
             password_visible: false,
             mode: appearance.mode,
             style: appearance.style,
+            display_scale: DisplayScaleChoice(100),
             accent,
             background,
             surface,
@@ -229,6 +254,7 @@ impl Form {
                 previous.log_level.clone()
             },
             appearance: Some(self.appearance.clone()),
+            display_scale: Some(self.display_scale.0),
         }
     }
 
@@ -239,6 +265,9 @@ impl Form {
         base: &AppConfig,
         system_dark: bool,
     ) -> Result<GuiOverrides> {
+        if !config::DISPLAY_SCALE_PRESETS.contains(&self.display_scale.0) {
+            bail!("显示缩放必须使用预设值");
+        }
         self.capture_colors(system_dark)?;
         appearance::validate(&self.appearance)?;
         let ssid = self.ssid.trim();
@@ -270,6 +299,7 @@ enum Message {
     CloseRequested(window::Id),
     SystemTheme(iced::theme::Mode),
     Scale(f32),
+    DisplayScale(DisplayScaleChoice),
     IconsReady,
     Login,
     TogglePause,
@@ -318,6 +348,7 @@ impl fmt::Debug for Message {
             Self::CloseRequested(_) => "CloseRequested",
             Self::SystemTheme(_) => "SystemTheme",
             Self::Scale(_) => "Scale",
+            Self::DisplayScale(_) => "DisplayScale",
             Self::IconsReady => "IconsReady",
             Self::Login => "Login",
             Self::TogglePause => "TogglePause",
@@ -399,6 +430,7 @@ struct App {
     shutdown_thread: Option<std::thread::JoinHandle<()>>,
     preview_login: Option<Instant>,
     icon_scale: f32,
+    logo_scale: f32,
     logo_color: [u8; 3],
     cached_theme: Theme,
     theme_appearance: Appearance,
@@ -426,11 +458,13 @@ impl App {
         let dark = background.r + background.g + background.b < 1.5;
         let color = self.cached_theme.palette().primary;
         let accent = [color.r, color.g, color.b].map(|n| (n * 255.0).round() as u8);
-        if accent != self.logo_color
-            && let Ok(logo) = load_logo(self.icon_scale, accent)
+        let logo_scale = self.icon_scale * self.form.display_scale.factor();
+        if (accent != self.logo_color || logo_scale != self.logo_scale)
+            && let Ok(logo) = load_logo(logo_scale, accent)
         {
             self.logo = logo;
             self.logo_color = accent;
+            self.logo_scale = logo_scale;
         }
         if let Some(tray) = &mut self.tray
             && tray.set_accent(accent).is_err()
@@ -444,6 +478,10 @@ impl App {
     }
     fn theme(&self, _: window::Id) -> Theme {
         self.cached_theme.clone()
+    }
+    fn scale_factor(&self, _: window::Id) -> f32 {
+        // Iced 会另行乘以 Windows DPI；这里只返回用户选择的界面倍率。
+        self.form.display_scale.factor()
     }
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
@@ -887,6 +925,7 @@ impl App {
                 | Message::Debug(_)
                 | Message::Mode(_)
                 | Message::Style(_)
+                | Message::DisplayScale(_)
                 | Message::Accent(_)
                 | Message::Background(_)
                 | Message::Surface(_)
@@ -939,10 +978,13 @@ impl App {
             }
             Message::Scale(scale) => {
                 self.icon_scale = scale;
-                if let Ok(logo) = load_logo(scale, self.logo_color) {
-                    self.logo = logo;
-                }
                 return self.refresh_native();
+            }
+            Message::DisplayScale(scale) => {
+                if !config::DISPLAY_SCALE_PRESETS.contains(&scale.0) {
+                    return Task::none();
+                }
+                self.form.display_scale = scale;
             }
             Message::IconsReady => return Task::none(),
             Message::OpenSettings => {
@@ -1224,18 +1266,22 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool
         icon_image.height(),
     )
     .ok();
+    let display_scale = DisplayScaleChoice(overrides.display_scale_percent());
     let (id, open) = window::open(window::Settings {
-        size: Size::new(432.0, 560.0),
-        min_size: Some(Size::new(360.0, 480.0)),
+        // Iced 打开窗口时会将 size 乘以用户倍率，保持外窗尺寸稳定。
+        size: default_window_size(display_scale),
+        min_size: Some(Size::new(360.0, 400.0)),
         resizable: true,
         visible: !hidden,
         exit_on_close_request: false,
         icon,
         ..window::Settings::default()
     });
+    let mut form = Form::new(&effective, saved_appearance.clone(), false, false);
+    form.display_scale = display_scale;
     let app = App {
         page: Page::Home,
-        form: Form::new(&effective, saved_appearance.clone(), false, false),
+        form,
         snapshot,
         startup_error,
         logs: VecDeque::new(),
@@ -1249,7 +1295,7 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool
         exit_confirm: false,
         exit_error: None,
         discard_on_exit: false,
-        logo: load_logo(1.0, logo_color)?,
+        logo: load_logo(display_scale.factor(), logo_color)?,
         advanced_colors: false,
         advanced_portal: false,
         primary_saved: PrimarySettings::from_config(&base),
@@ -1273,6 +1319,7 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool
         shutdown_thread: None,
         preview_login: None,
         icon_scale: 1.0,
+        logo_scale: display_scale.factor(),
         logo_color,
         cached_theme,
         theme_appearance,
@@ -1296,11 +1343,16 @@ pub fn run(config_path: PathBuf, preview: bool, hidden: bool, start_paused: bool
         "CUIT Helper"
     })
     .theme(App::theme)
+    .scale_factor(App::scale_factor)
     .subscription(App::subscription)
     .default_font(Font::with_name("Microsoft YaHei UI"))
     .antialiasing(true)
     .run()
     .map_err(|_| anyhow::anyhow!("桌面界面初始化失败，请检查显示环境"))
+}
+
+fn default_window_size(scale: DisplayScaleChoice) -> Size {
+    Size::new(380.0 / scale.factor(), 560.0 / scale.factor())
 }
 /// 在尚未建立 Iced 事件循环时呈现启动错误。
 pub fn show_error(message: &str) {
@@ -1366,6 +1418,7 @@ mod tests {
             shutdown_thread: None,
             preview_login: None,
             icon_scale: 1.0,
+            logo_scale: 1.0,
             logo_color: [0, 0, 0],
             cached_theme,
             theme_appearance: appearance,
@@ -1403,6 +1456,52 @@ mod tests {
         app.primary_saved = PrimarySettings::from_config(&app.base);
         app.form = Form::new(&app.base, Appearance::default(), false, false);
         app
+    }
+
+    #[test]
+    fn display_scale_changes_preview_immediately_and_autosaves_without_network() {
+        let mut app = valid_primary_app();
+        assert_eq!(app.scale_factor(app.window), 1.0);
+        assert_eq!(
+            DisplayScaleChoice::ALL
+                .iter()
+                .map(|s| s.0)
+                .collect::<Vec<_>>(),
+            config::DISPLAY_SCALE_PRESETS
+        );
+        for scale in DisplayScaleChoice::ALL {
+            let _ = app.update(Message::DisplayScale(*scale));
+            assert_eq!(app.scale_factor(app.window), scale.factor());
+            assert_eq!(app.logo_scale, app.icon_scale * scale.factor());
+            app.flush_autosave(Instant::now() + Duration::from_secs(2));
+            assert_eq!(app.overrides.display_scale, Some(scale.0));
+            assert!(!app.autosave.is_dirty());
+            assert!(app.worker.is_none());
+            assert!(app.autostart_intent.is_none());
+            assert_eq!(app.effective.wifi.ssid, "Synthetic_Campus");
+            let size = default_window_size(*scale);
+            assert!((size.width * scale.factor() - 380.0).abs() < 0.001);
+            assert!((size.height * scale.factor() - 560.0).abs() < 0.001);
+        }
+        let saved = serde_json::to_value(&app.overrides).unwrap();
+        let _ = app.update(Message::DisplayScale(DisplayScaleChoice(0)));
+        assert_eq!(app.scale_factor(app.window), 2.0);
+        assert_eq!(serde_json::to_value(&app.overrides).unwrap(), saved);
+        assert!(!app.autosave.is_dirty());
+    }
+
+    #[test]
+    fn display_scale_dpi_and_exit_draft_remain_independent() {
+        let mut app = valid_primary_app();
+        let _ = app.update(Message::DisplayScale(DisplayScaleChoice(150)));
+        let _ = app.update(Message::Scale(2.0));
+        assert_eq!(app.scale_factor(app.window), 1.5);
+        assert_eq!(app.icon_scale, 2.0);
+        assert_eq!(app.logo_scale, 3.0);
+        let plan = app.prepare_exit_plan().unwrap();
+        assert_eq!(plan.overrides.unwrap().display_scale, Some(150));
+        assert!(plan.primary.is_none());
+        assert!(plan.autostart.is_none());
     }
 
     #[test]

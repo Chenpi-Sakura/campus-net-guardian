@@ -1,8 +1,8 @@
 //! 使用 Iced 标准控件呈现状态和同窗设置；暖中性色降低常驻工具的视觉干扰。
 
 use super::{
-    App, IntervalChoice, Message, Page, RecoveryChoice, ServiceChoice, ThresholdChoice, motion,
-    scroll_edge, smooth_scroll,
+    App, DisplayScaleChoice, IntervalChoice, Message, Page, RecoveryChoice, ServiceChoice,
+    ThresholdChoice, motion, scroll_edge, smooth_scroll,
 };
 use crate::config::{ThemeMode, ThemeStyle};
 use crate::daemon::Status;
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const TWO_COLUMN_WIDTH: f32 = 680.0;
 const CONTENT_MAX_WIDTH: f32 = 1000.0;
+const COMPACT_WIDTH: f32 = 320.0;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -402,23 +403,26 @@ fn home(app: &App) -> Element<'_, Message> {
 
 fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
     let wide = width >= TWO_COLUMN_WIDTH;
+    let compact = width < COMPACT_WIDTH;
     let available_width = (width - 43.0).min(CONTENT_MAX_WIDTH);
     let status_width = if wide {
         (available_width - 20.0) / 2.0
     } else {
         available_width
     };
+    let mut heading = column![title("CUIT Helper", 20.0).wrapping(text::Wrapping::Glyph)]
+        .spacing(3)
+        .width(Fill);
+    if !compact {
+        heading = heading.push(muted("保持连接，少一点打扰。", 11.0));
+    }
     let header = row![
         image(app.logo.clone())
             .width(34)
             .height(34)
             .filter_method(image::FilterMethod::Linear)
             .content_fit(iced::ContentFit::Contain),
-        column![
-            title("CUIT Helper", 20.0),
-            muted("保持连接，少一点打扰。", 11.0)
-        ]
-        .spacing(3)
+        heading
     ]
     .spacing(12)
     .align_y(Alignment::Center);
@@ -540,7 +544,7 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
         column![
             row![muted("当前连接", 12.0), space().width(Fill), status_badge]
                 .align_y(Alignment::Center),
-            title(state, 27.0),
+            title(state, 27.0).wrapping(text::Wrapping::Glyph),
             muted(detail, 13.0),
             line(),
             metadata
@@ -551,37 +555,37 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
     .width(Fill)
     .style(surface);
 
-    let actions = row![
-        button(centered(
-            if app.snapshot.busy {
-                "正在连接…"
-            } else {
-                "立即登录"
-            },
-            14.0
-        ))
-        .on_press_maybe(
-            (!app.snapshot.busy && app.startup_error.is_none()).then_some(Message::Login)
-        )
-        .width(Fill)
-        .padding([8, 14])
-        .height(38)
-        .style(primary),
-        button(centered(
-            if app.snapshot.paused {
-                "恢复守护"
-            } else {
-                "暂停守护"
-            },
-            14.0
-        ))
-        .on_press_maybe(app.startup_error.is_none().then_some(Message::TogglePause))
-        .width(Fill)
-        .padding([8, 14])
-        .height(38)
-        .style(secondary)
-    ]
-    .spacing(8);
+    let login = button(centered(
+        if app.snapshot.busy {
+            "正在连接…"
+        } else {
+            "立即登录"
+        },
+        14.0,
+    ))
+    .on_press_maybe((!app.snapshot.busy && app.startup_error.is_none()).then_some(Message::Login))
+    .width(Fill)
+    .padding([8, 14])
+    .height(38)
+    .style(primary);
+    let pause = button(centered(
+        if app.snapshot.paused {
+            "恢复守护"
+        } else {
+            "暂停守护"
+        },
+        14.0,
+    ))
+    .on_press_maybe(app.startup_error.is_none().then_some(Message::TogglePause))
+    .width(Fill)
+    .padding([8, 14])
+    .height(38)
+    .style(secondary);
+    let actions: Element<'_, Message> = if compact {
+        column![login, pause].spacing(8).into()
+    } else {
+        row![login, pause].spacing(8).into()
+    };
 
     let mut log_entries = Column::new().spacing(7);
     if app.logs.is_empty() {
@@ -621,7 +625,7 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
     let mut content = column![inset_content(
         header,
         iced::Padding {
-            top: 16.0,
+            top: if compact { 12.0 } else { 16.0 },
             right: 27.0,
             left: 16.0,
             ..Default::default()
@@ -630,7 +634,14 @@ fn home_at_width(app: &App, width: f32) -> Element<'_, Message> {
     .spacing(10);
     if app.preview {
         content = content.push(inset_content(
-            muted("离线预览 · 不会认证或切换网络", 11.0),
+            muted(
+                if compact {
+                    "离线预览"
+                } else {
+                    "离线预览 · 不会认证或切换网络"
+                },
+                11.0,
+            ),
             iced::Padding {
                 left: 16.0,
                 right: 27.0,
@@ -704,13 +715,23 @@ fn toggle_row<'a>(
 }
 
 fn select_row<'a>(
+    compact: bool,
     name: &'static str,
     field: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![label(name, 13.0).width(Fill), motion::popup_anchor(field)]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .into()
+    let field =
+        motion::popup_anchor(container(field).width(if compact { Fill } else { 174.0.into() }));
+    if compact {
+        column![label(name, 13.0), field]
+            .spacing(5)
+            .width(Fill)
+            .into()
+    } else {
+        row![label(name, 13.0).width(Fill), field]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+    }
 }
 
 fn hex_color(value: &str) -> Option<Color> {
@@ -727,6 +748,7 @@ fn hex_color(value: &str) -> Option<Color> {
 }
 
 fn color_field<'a>(
+    compact: bool,
     name: &'static str,
     value: &'a str,
     on_input: fn(String) -> Message,
@@ -753,7 +775,7 @@ fn color_field<'a>(
         .font(Font::MONOSPACE)
         .size(13)
         .padding([7, 10])
-        .width(115)
+        .width(Fill)
         .on_input(on_input)
         .style(move |theme, status| {
             let mut style = field(theme, status);
@@ -763,31 +785,50 @@ fn color_field<'a>(
             style
         });
     select_row(
+        compact,
         name,
-        row![swatch, input].spacing(8).align_y(Alignment::Center),
+        row![swatch, container(input).width(Fill).max_width(115)]
+            .spacing(8)
+            .align_y(Alignment::Center),
     )
 }
 
-fn appearance(app: &App) -> Element<'_, Message> {
+fn appearance(app: &App, compact: bool) -> Element<'_, Message> {
     let section = column![
         muted("外观", 11.5),
         select_row(
+            compact,
             "明暗模式",
             pick_list(ThemeMode::ALL, Some(app.form.mode), Message::Mode)
-                .width(174)
+                .width(Fill)
                 .padding([7, 10])
                 .text_size(13)
                 .style(selection)
                 .menu_style(menu),
         ),
         select_row(
+            compact,
             "设计风格",
             pick_list(ThemeStyle::ALL, Some(app.form.style), Message::Style)
-                .width(174)
+                .width(Fill)
                 .padding([7, 10])
                 .text_size(13)
                 .style(selection)
                 .menu_style(menu),
+        ),
+        select_row(
+            compact,
+            "显示大小",
+            pick_list(
+                DisplayScaleChoice::ALL,
+                Some(app.form.display_scale),
+                Message::DisplayScale,
+            )
+            .width(Fill)
+            .padding([7, 10])
+            .text_size(13)
+            .style(selection)
+            .menu_style(menu),
         ),
         button(label(
             if app.advanced_colors {
@@ -803,16 +844,34 @@ fn appearance(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10);
     let details = column![
-        color_field("强调色", &app.form.accent, Message::Accent, |p| p.accent,),
         color_field(
+            compact,
+            "强调色",
+            &app.form.accent,
+            Message::Accent,
+            |p| p.accent,
+        ),
+        color_field(
+            compact,
             "背景色",
             &app.form.background,
             Message::Background,
             |p| p.background,
         ),
-        color_field("表面色", &app.form.surface, Message::Surface, |p| p
-            .surface,),
-        color_field("文字色", &app.form.text, Message::TextColor, |p| p.text,),
+        color_field(
+            compact,
+            "表面色",
+            &app.form.surface,
+            Message::Surface,
+            |p| p.surface,
+        ),
+        color_field(
+            compact,
+            "文字色",
+            &app.form.text,
+            Message::TextColor,
+            |p| p.text,
+        ),
         muted("输入 #RRGGBB 即可预览，更改会自动保存。", 11.0),
         button(label("恢复此主题默认颜色", 12.0))
             .padding([6, 0])
@@ -855,7 +914,7 @@ fn network_field<'a>(
     .into()
 }
 
-fn primary_network(app: &App) -> Element<'_, Message> {
+fn primary_network(app: &App, compact: bool) -> Element<'_, Message> {
     let password = text_input("校园网密码", &app.form.account_password)
         .size(13)
         .padding([8, 10])
@@ -898,9 +957,10 @@ fn primary_network(app: &App) -> Element<'_, Message> {
         ]
         .spacing(5),
         select_row(
+            compact,
             "运营商",
             pick_list(ServiceChoice::ALL, Some(app.form.service), Message::Service)
-                .width(174)
+                .width(Fill)
                 .padding([7, 10])
                 .text_size(13)
                 .style(selection)
@@ -955,13 +1015,22 @@ fn primary_network(app: &App) -> Element<'_, Message> {
 }
 
 fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
+    let compact = width < COMPACT_WIDTH;
+    let mut heading = column![title(
+        if compact {
+            "设置"
+        } else {
+            "CUIT Helper 设置"
+        },
+        22.0,
+    )]
+    .spacing(5)
+    .width(Fill);
+    if !compact {
+        heading = heading.push(muted("让守护按照你的习惯工作。", 12.0));
+    }
     let header = row![
-        column![
-            title("CUIT Helper 设置", 22.0),
-            muted("让守护按照你的习惯工作。", 12.0)
-        ]
-        .spacing(5)
-        .width(Fill),
+        heading,
         button(label("返回", 13.0))
             .on_press(Message::Back)
             .padding([8, 16])
@@ -1054,13 +1123,14 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
             ));
         }
         details.push(select_row(
+            compact,
             "切回校园网",
             pick_list(
                 RecoveryChoice::ALL,
                 Some(app.form.recovery),
                 Message::Recovery,
             )
-            .width(174)
+            .width(Fill)
             .padding([7, 10])
             .text_size(13)
             .style(selection)
@@ -1081,26 +1151,28 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
     let guardian = column![
         muted("连接守护", 11.5),
         select_row(
+            compact,
             "探测间隔",
             pick_list(
                 IntervalChoice::ALL,
                 Some(app.form.interval),
                 Message::Interval,
             )
-            .width(174)
+            .width(Fill)
             .padding([7, 10])
             .text_size(13)
             .style(selection)
             .menu_style(menu),
         ),
         select_row(
+            compact,
             "掉线判定",
             pick_list(
                 ThresholdChoice::ALL,
                 Some(app.form.threshold),
                 Message::Threshold,
             )
-            .width(174)
+            .width(Fill)
             .padding([7, 10])
             .text_size(13)
             .style(selection)
@@ -1115,30 +1187,39 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
     ]
     .spacing(10);
 
+    let open_config = button(centered("打开配置文件", 13.0))
+        .on_press(Message::OpenConfig)
+        .width(Fill)
+        .padding([8, 10])
+        .style(secondary);
+    let open_log = button(centered("打开日志", 13.0))
+        .on_press(Message::OpenLog)
+        .width(Fill)
+        .padding([8, 10])
+        .style(secondary);
+    let file_actions: Element<'_, Message> = if compact {
+        column![open_config, open_log].spacing(8).into()
+    } else {
+        row![open_config, open_log].spacing(10).into()
+    };
     let files = column![
         muted("配置与日志", 11.5),
-        row![
-            button(centered("打开配置文件", 13.0))
-                .on_press(Message::OpenConfig)
-                .width(Fill)
-                .padding([8, 10])
-                .style(secondary),
-            button(centered("打开日志", 13.0))
-                .on_press(Message::OpenLog)
-                .width(Fill)
-                .padding([8, 10])
-                .style(secondary)
-        ]
-        .spacing(10),
+        file_actions,
         muted("超时、重试等高级参数可在配置文件中调整。", 11.0)
     ]
     .spacing(10);
 
     let body: Element<'_, Message> = if width >= TWO_COLUMN_WIDTH {
         row![
-            column![primary_network(app), line(), appearance(app), line(), start]
-                .spacing(12)
-                .width(Fill),
+            column![
+                primary_network(app, compact),
+                line(),
+                appearance(app, compact),
+                line(),
+                start
+            ]
+            .spacing(12)
+            .width(Fill),
             column![fallback, line(), guardian, line(), files]
                 .spacing(12)
                 .width(Fill)
@@ -1148,9 +1229,9 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
         .into()
     } else {
         column![
-            primary_network(app),
+            primary_network(app, compact),
             line(),
-            appearance(app),
+            appearance(app, compact),
             line(),
             start,
             line(),
@@ -1175,16 +1256,23 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
     let mut page = column![inset_content(
         header,
         iced::Padding {
-            top: 16.0,
+            top: if compact { 12.0 } else { 16.0 },
             right: 27.0,
             left: 16.0,
             ..Default::default()
         }
     )]
-    .spacing(12);
+    .spacing(if compact { 8 } else { 12 });
     if app.preview {
         page = page.push(inset_content(
-            muted("离线预览 · 设置不会写入文件或改变网络", 11.0),
+            muted(
+                if compact {
+                    "离线预览"
+                } else {
+                    "离线预览 · 设置不会写入文件或改变网络"
+                },
+                11.0,
+            ),
             iced::Padding {
                 left: 16.0,
                 right: 27.0,
@@ -1238,6 +1326,11 @@ fn settings_at_width(app: &App, width: f32) -> Element<'_, Message> {
 }
 
 fn exit_confirmation(app: &App) -> Element<'_, Message> {
+    responsive(move |size| exit_confirmation_at_size(app, size)).into()
+}
+
+fn exit_confirmation_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
+    let compact = size.width < COMPACT_WIDTH;
     let exiting = app.shutdown.is_some();
     let mut content = column![
         title(
@@ -1261,35 +1354,36 @@ fn exit_confirmation(app: &App) -> Element<'_, Message> {
     if let Some(error) = &app.exit_error {
         content = content.push(notice(error, true));
     }
-    content = content.push(
-        row![
-            button(centered(
-                if app.exit_error.is_some() {
-                    "返回"
-                } else {
-                    "继续守护"
-                },
-                13.0
-            ))
-            .on_press_maybe((!exiting).then_some(Message::CancelExit))
-            .width(Fill)
-            .padding([8, 10])
-            .style(secondary),
-            button(centered(
-                if app.exit_error.is_some() {
-                    "重试保存并退出"
-                } else {
-                    "确认退出"
-                },
-                13.0
-            ))
-            .on_press_maybe((!exiting).then_some(Message::ConfirmExit))
-            .width(Fill)
-            .padding([8, 10])
-            .style(primary)
-        ]
-        .spacing(10),
-    );
+    let cancel = button(centered(
+        if app.exit_error.is_some() {
+            "返回"
+        } else {
+            "继续守护"
+        },
+        13.0,
+    ))
+    .on_press_maybe((!exiting).then_some(Message::CancelExit))
+    .width(Fill)
+    .padding([8, 10])
+    .style(secondary);
+    let confirm = button(centered(
+        if app.exit_error.is_some() {
+            "重试保存并退出"
+        } else {
+            "确认退出"
+        },
+        13.0,
+    ))
+    .on_press_maybe((!exiting).then_some(Message::ConfirmExit))
+    .width(Fill)
+    .padding([8, 10])
+    .style(primary);
+    let actions: Element<'_, Message> = if compact {
+        column![cancel, confirm].spacing(8).into()
+    } else {
+        row![cancel, confirm].spacing(10).into()
+    };
+    content = content.push(actions);
     if app.discard_on_exit {
         content = content.push(
             button(centered("放弃修改并退出", 12.0))
@@ -1299,10 +1393,18 @@ fn exit_confirmation(app: &App) -> Element<'_, Message> {
                 .style(quiet),
         );
     }
-    container(container(content).padding(20).max_width(416).style(surface))
-        .padding(16)
-        .center(Fill)
-        .into()
+    let dialog = container(smooth_scroll::wrap(
+        scrollable(content)
+            .height(iced::Shrink)
+            .width(Fill)
+            .direction(scrollable::Direction::Vertical(edge_scrollbar()))
+            .style(scrollbar),
+    ))
+    .padding(if compact { 12 } else { 20 })
+    .max_width(416)
+    .max_height((size.height - 32.0).max(0.0))
+    .style(surface);
+    container(dialog).padding(16).center(Fill).into()
 }
 
 fn feedback_is_error(message: &str) -> bool {

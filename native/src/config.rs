@@ -925,6 +925,9 @@ fn appearance_from_json(value: &serde_json::Value) -> Option<Appearance> {
         .filter(|appearance| appearance.validate().is_ok())
 }
 
+/// 界面显示缩放的百分比预设；独立于操作系统 DPI 与主题配色。
+pub const DISPLAY_SCALE_PRESETS: &[u16] = &[50, 67, 90, 100, 110, 125, 150, 200];
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiOverrides {
@@ -936,8 +939,16 @@ pub struct GuiOverrides {
     pub switch_back_interval: Option<u64>,
     pub log_level: Option<String>,
     pub appearance: Option<Appearance>,
+    pub display_scale: Option<u16>,
 }
 impl GuiOverrides {
+    /// 返回合法显示缩放，旧配置或无效值使用 100%。
+    pub fn display_scale_percent(&self) -> u16 {
+        self.display_scale
+            .filter(|v| DISPLAY_SCALE_PRESETS.contains(v))
+            .unwrap_or(100)
+    }
+
     /// 容错读取既有 GUI JSON；错误字段单独忽略，不丢弃其它合法设置。
     pub fn load() -> Self {
         Self::load_from(&data_dir().join("gui_settings.json"))
@@ -969,6 +980,10 @@ impl GuiOverrides {
                 .map(str::to_uppercase)
                 .filter(|v| matches!(v.as_str(), "INFO" | "DEBUG")),
             appearance: appearance_from_json(&raw["appearance"]),
+            display_scale: raw["display_scale"]
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| DISPLAY_SCALE_PRESETS.contains(v)),
         }
     }
 
@@ -978,6 +993,12 @@ impl GuiOverrides {
     }
     /// 原子保存到指定路径，失败时清理本次临时文件。
     pub fn save_to(&self, path: &Path) -> Result<()> {
+        if self
+            .display_scale
+            .is_some_and(|v| !DISPLAY_SCALE_PRESETS.contains(&v))
+        {
+            bail!("显示缩放必须使用预设值");
+        }
         if let Some(appearance) = &self.appearance {
             appearance.validate()?;
         }
@@ -1577,6 +1598,87 @@ env_overrides: {}
         assert_eq!(ov.switch_back_interval, Some(0));
         assert!(ov.appearance.is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn display_scale_presets_roundtrip_and_old_settings_default_to_full_size() {
+        let dir =
+            std::env::temp_dir().join(format!("cng-display-scale-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, br#"{"probe_interval":60}"#).unwrap();
+        let old = GuiOverrides::load_from(&path);
+        assert_eq!(old.display_scale, None);
+        assert_eq!(old.display_scale_percent(), 100);
+        assert_eq!(old.probe_interval, Some(60));
+        for &scale in DISPLAY_SCALE_PRESETS {
+            let settings = GuiOverrides {
+                display_scale: Some(scale),
+                probe_interval: Some(60),
+                appearance: Some(Appearance::default()),
+                ..Default::default()
+            };
+            settings.save_to(&path).unwrap();
+            let loaded = GuiOverrides::load_from(&path);
+            assert_eq!(loaded.display_scale, Some(scale));
+            assert_eq!(loaded.display_scale_percent(), scale);
+            assert_eq!(loaded.probe_interval, Some(60));
+            assert_eq!(loaded.appearance, Some(Appearance::default()));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn malformed_display_scale_is_ignored_without_losing_other_preferences() {
+        let dir =
+            std::env::temp_dir().join(format!("cng-invalid-scale-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        for scale in [
+            serde_json::json!(null),
+            serde_json::json!("125"),
+            serde_json::json!(125.0),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(-100),
+            serde_json::json!(0),
+            serde_json::json!(99),
+            serde_json::json!(201),
+            serde_json::json!(u64::MAX),
+        ] {
+            let raw = serde_json::json!({
+                "display_scale": scale,
+                "probe_interval": 60,
+                "fallback_enabled": false,
+                "appearance": {"style": "chat_gpt"}
+            });
+            fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            let loaded = GuiOverrides::load_from(&path);
+            assert_eq!(loaded.display_scale, None);
+            assert_eq!(loaded.display_scale_percent(), 100);
+            assert_eq!(loaded.probe_interval, Some(60));
+            assert_eq!(loaded.fallback_enabled, Some(false));
+            assert_eq!(loaded.appearance.unwrap().style, ThemeStyle::ChatGpt);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn invalid_display_scale_save_preserves_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!("cng-scale-save-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let previous = br#"{"display_scale":125,"probe_interval":60}"#;
+        fs::write(&path, previous).unwrap();
+        for scale in [0, 49, 51, 99, 101, 126, 201, u16::MAX] {
+            let settings = GuiOverrides {
+                display_scale: Some(scale),
+                ..Default::default()
+            };
+            assert_eq!(settings.display_scale_percent(), 100);
+            assert!(settings.save_to(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), previous);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn appearance_defaults_and_enum_json_remain_stable() {
