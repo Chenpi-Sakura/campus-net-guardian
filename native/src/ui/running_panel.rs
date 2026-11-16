@@ -223,34 +223,16 @@ impl State {
             .unwrap_or_else(|| self.campus_choices().remove(0))
     }
     pub(super) fn route_choices(&self) -> Vec<Choice> {
-        let mut choices = vec![Choice {
-            id: String::new(),
-            name: "校园内道路（随机）".into(),
-        }];
-        if let Some(campus) = self
-            .catalog
-            .campuses
-            .iter()
-            .find(|c| c.id == self.active_id())
-        {
-            choices.push(Choice {
+        vec![
+            Choice {
+                id: String::new(),
+                name: "校园内道路（随机）".into(),
+            },
+            Choice {
                 id: "@track".into(),
                 name: "运动场（随机环线）".into(),
-            });
-            choices.extend(campus.routes.iter().map(|r| Choice {
-                id: r.id.clone(),
-                name: format!(
-                    "{} · {}",
-                    if r.id.starts_with("track-") {
-                        "运动场"
-                    } else {
-                        "校园内道路"
-                    },
-                    r.name
-                ),
-            }));
-        }
-        choices
+            },
+        ]
     }
     pub(super) fn selected_route(&self) -> Choice {
         self.route_choices()
@@ -614,6 +596,18 @@ fn align_random_duration(preview: &mut Preview) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn route_menu_has_only_random_categories_and_noise_is_selectable() {
+        let mut state = state();
+        let choices = state.route_choices();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].id, "");
+        assert_eq!(choices[1].id, "@track");
+        for &level in Noise::ALL {
+            state.handle(Message::Noise(level), true);
+            assert_eq!(state.noise, level);
+        }
+    }
     fn state() -> State {
         State::new(RunningSettings::default(), PathBuf::from("."))
     }

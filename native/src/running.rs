@@ -349,6 +349,23 @@ pub fn generate(
     })?;
     let target = request.distance_m as f64;
     let mut rng = Rng(request.seed);
+    let mut adjacency: Vec<Vec<usize>> = campus
+        .nodes
+        .iter()
+        .map(|node| {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("路线生成已取消");
+            }
+            Ok(node
+                .edges
+                .iter()
+                .copied()
+                .filter(|&next| {
+                    segment_allowed(campus.map.as_ref(), node.point, campus.nodes[next].point)
+                })
+                .collect())
+        })
+        .collect::<Result<_>>()?;
     let track_nodes: HashSet<_> = campus
         .routes
         .iter()
@@ -366,6 +383,38 @@ pub fn generate(
                 .ok_or_else(|| anyhow::anyhow!("找不到指定预设路线"))
         })
         .transpose()?;
+    if let Some(route) = preset {
+        if route
+            .nodes
+            .windows(2)
+            .any(|pair| !adjacency[pair[0]].contains(&pair[1]))
+        {
+            bail!("路线穿过避让区域，请选择其他运动场");
+        }
+    } else {
+        // 迭代剔除死路，只在具有环路的道路核心中生成随机路线。
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("路线生成已取消");
+            }
+            let leaves: Vec<_> = adjacency
+                .iter()
+                .enumerate()
+                .filter(|(i, edges)| {
+                    !edges.is_empty() && (edges.len() < 2 || track_nodes.contains(i))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if leaves.is_empty() {
+                break;
+            }
+            for node in leaves {
+                for next in std::mem::take(&mut adjacency[node]) {
+                    adjacency[next].retain(|&other| other != node);
+                }
+            }
+        }
+    }
     let sequence = preset.map(|route| {
         let mut nodes = route.nodes.clone();
         if nodes.first() == nodes.last() {
@@ -383,10 +432,10 @@ pub fn generate(
         route[0]
     } else {
         let roads: Vec<_> = (0..campus.nodes.len())
-            .filter(|node| !track_nodes.contains(node))
+            .filter(|&node| !adjacency[node].is_empty() && !track_nodes.contains(&node))
             .collect();
         if roads.is_empty() {
-            bail!("此校区没有可随机生成的校园道路");
+            bail!("避开水域和死路后，此校区没有可生成的校园道路环路");
         }
         roads[rng.usize(roads.len())]
     };
@@ -395,6 +444,7 @@ pub fn generate(
     let mut current = start;
     let mut previous = None;
     let mut route_cursor = 1usize;
+    let mut edge_visits = std::collections::HashMap::<(usize, usize), u32>::new();
     for step in 0..MAX_STEPS {
         if step % 64 == 0 && cancel.load(Ordering::Relaxed) {
             bail!("路线生成已取消");
@@ -407,7 +457,7 @@ pub fn generate(
             route_cursor += 1;
             n
         } else {
-            let edges = &campus.nodes[current].edges;
+            let edges = &adjacency[current];
             let available: Vec<_> = edges
                 .iter()
                 .copied()
@@ -426,8 +476,34 @@ pub fn generate(
             } else {
                 &options
             };
-            options[rng.usize(options.len())]
+            // 同一条边的双向使用共同计数，优先探索较少经过的道路。
+            let weights: Vec<_> = options
+                .iter()
+                .map(|&next| {
+                    let visits = edge_visits
+                        .get(&(current.min(next), current.max(next)))
+                        .copied()
+                        .unwrap_or(0);
+                    1 + 1024 / (1 + visits as usize).saturating_pow(2)
+                })
+                .collect();
+            let mut ticket = rng.usize(weights.iter().sum());
+            let mut selected = options[0];
+            for (&next, weight) in options.iter().zip(weights) {
+                if ticket < weight {
+                    selected = next;
+                    break;
+                }
+                ticket -= weight;
+            }
+            selected
         };
+        if !adjacency[current].contains(&next) {
+            bail!("路线连接穿过避让区域");
+        }
+        *edge_visits
+            .entry((current.min(next), current.max(next)))
+            .or_default() += 1;
         let a = campus.nodes[current].point;
         let b = campus.nodes[next].point;
         let length = distance(a, b);
@@ -455,6 +531,7 @@ pub fn generate(
     let amplitude = request.noise.max_offset_m();
     let phase = rng.unit() * std::f64::consts::TAU;
     let mut positions = vec![raw[0]];
+    let mut base_positions = vec![raw[0]];
     let mut along = 0.;
     for pair in raw.windows(2) {
         let a = pair[0];
@@ -480,12 +557,41 @@ pub fn generate(
             let dy = amplitude / std::f64::consts::SQRT_2
                 * envelope
                 * (0.65 * (d / 120. - phase).cos() + 0.35 * (d / 180. + phase).sin());
+            base_positions.push(Point {
+                x: a.x + (b.x - a.x) * t,
+                y: a.y + (b.y - a.y) * t,
+            });
             positions.push(Point {
                 x: a.x + (b.x - a.x) * t + dx,
                 y: a.y + (b.y - a.y) * t + dy,
             });
         }
         along += length;
+    }
+    // 局部压低接近禁区的偏移，同时检查相邻点连线，避免跨越细小区域。
+    for _ in 0..16 {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("路线生成已取消");
+        }
+        let collisions: Vec<_> = positions
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| !segment_allowed(campus.map.as_ref(), pair[0], pair[1]))
+            .map(|(i, _)| i)
+            .collect();
+        if collisions.is_empty() {
+            break;
+        }
+        for i in collisions {
+            positions[i] = base_positions[i];
+            positions[i + 1] = base_positions[i + 1];
+        }
+    }
+    if positions
+        .windows(2)
+        .any(|pair| !segment_allowed(campus.map.as_ref(), pair[0], pair[1]))
+    {
+        positions = base_positions;
     }
     if cancel.load(Ordering::Relaxed) {
         bail!("路线生成已取消");
@@ -514,6 +620,64 @@ pub fn generate(
 }
 fn distance(a: Point, b: Point) -> f64 {
     (a.x - b.x).hypot(a.y - b.y)
+}
+
+fn segment_allowed(map: Option<&MapData>, a: Point, b: Point) -> bool {
+    let Some(map) = map else {
+        return true;
+    };
+    !map.water
+        .iter()
+        .filter(|polygon| polygon.len() >= 3)
+        .any(|polygon| {
+            point_in_polygon(a, polygon)
+                || point_in_polygon(b, polygon)
+                || polygon
+                    .iter()
+                    .zip(polygon.iter().cycle().skip(1))
+                    .any(|(&c, &d)| segments_near(a, b, c, d, 5.0))
+        })
+}
+
+fn point_in_polygon(point: Point, polygon: &[Point]) -> bool {
+    let mut inside = false;
+    for (&a, &b) in polygon.iter().zip(polygon.iter().cycle().skip(1)) {
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn point_segment_distance(p: Point, a: Point, b: Point) -> f64 {
+    let length_squared = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
+    if length_squared < 1e-12 {
+        return distance(p, a);
+    }
+    let t =
+        (((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / length_squared).clamp(0.0, 1.0);
+    distance(
+        p,
+        Point {
+            x: a.x + t * (b.x - a.x),
+            y: a.y + t * (b.y - a.y),
+        },
+    )
+}
+
+fn segments_near(a: Point, b: Point, c: Point, d: Point, margin: f64) -> bool {
+    let cross =
+        |p: Point, q: Point, r: Point| (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    if cross(a, b, c) * cross(a, b, d) < 0.0 && cross(c, d, a) * cross(c, d, b) < 0.0 {
+        return true;
+    }
+    point_segment_distance(a, c, d)
+        .min(point_segment_distance(b, c, d))
+        .min(point_segment_distance(c, a, b))
+        .min(point_segment_distance(d, a, b))
+        <= margin
 }
 struct Rng(u64);
 /// 生成成组的模拟默认值：距离精确到米，范围 1500–4500 米，配速保持 6–9 分钟每公里。
@@ -687,11 +851,75 @@ mod tests {
             assert_eq!(preview.points.last().unwrap().elapsed_millis, 300_000);
             for route in &campus.routes {
                 random.preset_id = Some(route.id.clone());
+                if route.nodes.windows(2).any(|pair| {
+                    !segment_allowed(
+                        campus.map.as_ref(),
+                        campus.nodes[pair[0]].point,
+                        campus.nodes[pair[1]].point,
+                    )
+                }) {
+                    assert!(
+                        !route.id.starts_with("track-"),
+                        "内置运动场不应被水域避让误伤"
+                    );
+                    assert!(generate(campus, &random, &cancel).is_err());
+                    continue;
+                }
                 let preview = generate(campus, &random, &cancel).unwrap();
                 assert_eq!(preview.points.last().unwrap().elapsed_millis, 300_000);
                 assert!((preview.distance_m - 1000.).abs() < 0.001);
             }
         }
+    }
+    #[test]
+    fn random_routes_avoid_water_and_nearby_paths_after_noise() {
+        let catalog = builtin_catalog().unwrap();
+        for seed in 0..12 {
+            let mut request = req(seed);
+            request.preset_id = None;
+            request.noise = Noise::Strong;
+            let campus = &catalog.campuses[0];
+            let preview = generate(campus, &request, &AtomicBool::new(false)).unwrap();
+            assert!(preview.points.windows(2).all(|pair| segment_allowed(
+                campus.map.as_ref(),
+                pair[0].position,
+                pair[1].position
+            )));
+            for triple in preview.reference.windows(3) {
+                assert_ne!(triple[0], triple[2], "道路核心不应立即掉头");
+            }
+        }
+    }
+
+    #[test]
+    fn water_buffer_preserves_roads_outside_the_shoreline() {
+        let mut map = builtin_catalog().unwrap().campuses.remove(0).map.unwrap();
+        map.water = vec![vec![
+            Point { x: 0., y: 0. },
+            Point { x: 10., y: 0. },
+            Point { x: 10., y: 10. },
+            Point { x: 0., y: 10. },
+        ]];
+        assert!(!segment_allowed(
+            Some(&map),
+            Point { x: -10., y: 5. },
+            Point { x: 20., y: 5. }
+        ));
+        assert!(!segment_allowed(
+            Some(&map),
+            Point { x: -10., y: 13. },
+            Point { x: 20., y: 13. }
+        ));
+        assert!(segment_allowed(
+            Some(&map),
+            Point { x: -10., y: 16. },
+            Point { x: 20., y: 16. }
+        ));
+        assert!(segment_allowed(
+            Some(&map),
+            Point { x: -10., y: -6. },
+            Point { x: 20., y: -6. }
+        ));
     }
     #[test]
     fn map_bounds_and_point_limits_are_enforced_and_legacy_config_is_compatible() {

@@ -901,11 +901,13 @@ impl Widget<Message, Theme, Renderer> for Flow<'_> {
         }
         match native {
             Some(inner) => {
-                let anchor = POPUP_ANCHOR.with(Cell::get).unwrap_or(Anchor {
-                    id: 0,
-                    bounds: layout.bounds(),
-                    revision: 0,
-                });
+                // 提示浮层沿用原生事件处理，只有显式标记的下拉菜单参与菜单动画。
+                let Some(anchor) = POPUP_ANCHOR.with(Cell::get) else {
+                    state.overlay_present = false;
+                    state.overlay_anchor_id = None;
+                    state.closing = None;
+                    return Some(inner);
+                };
                 state.open_overlay(anchor.id);
                 Some(overlay::Element::new(Box::new(Popup {
                     inner,
@@ -1199,6 +1201,63 @@ impl overlay::Overlay<Message, Theme, Renderer> for Popup<'_> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn native_tooltip_keeps_noise_button_clickable_while_open() {
+        let mut cache = iced_runtime::user_interface::Cache::new();
+        let mut renderer = Renderer::new(iced::Font::DEFAULT, iced::Pixels(13.0));
+        let mut messages = Vec::new();
+        let cursor = mouse::Cursor::Available(iced::Point::new(40., 18.));
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: iced::Point::new(40., 18.),
+            }),
+            Event::Window(iced::window::Event::RedrawRequested(
+                Instant::now() + Duration::from_secs(3),
+            )),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ] {
+            let control =
+                iced::widget::button("中")
+                    .width(120)
+                    .height(36)
+                    .on_press(Message::Running(
+                        super::super::running_panel::Message::Noise(crate::running::Noise::Medium),
+                    ));
+            let tooltip = iced::widget::tooltip(
+                control,
+                "最大模拟偏移：10 米",
+                iced::widget::tooltip::Position::Top,
+            );
+            let mut ui = iced_runtime::UserInterface::build(
+                page(0, Theme::Light, tooltip.into()),
+                Size::new(420., 520.),
+                cache,
+                &mut renderer,
+            );
+            ui.update(
+                &[event],
+                cursor,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            ui.draw(
+                &mut renderer,
+                &Theme::Light,
+                &renderer::Style::default(),
+                cursor,
+            );
+            cache = ui.into_cache();
+        }
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Running(super::super::running_panel::Message::Noise(
+                crate::running::Noise::Medium
+            ))
+        )));
+    }
 
     fn native_picker(top: f32, pair: bool) -> Element<'static, Message> {
         const OPTIONS: &[&str] = &["Synthetic A", "Synthetic B"];

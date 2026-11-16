@@ -1175,7 +1175,7 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         select_row(compact, "本次校区", campus),
         select_row(compact, "路线", route),
         inputs,
-        select_row(compact, "路线扰动", noise),
+        column![label("路线扰动", 13.0), noise].spacing(5),
         toggle_row(
             "随机距离与时长",
             "模拟配速 6–9 分钟/公里",
