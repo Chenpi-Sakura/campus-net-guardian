@@ -541,7 +541,11 @@ impl App {
                 Some(("请先在校园跑设置中填写手机号和密码".into(), true));
             return;
         }
-        if self.send(Command::RunPlatformLogin { phone, password }) {
+        if self.send(Command::RunPlatformLogin {
+            phone,
+            password,
+            contract: Box::new(self.running.prefs.platform_contract()),
+        }) {
             self.running.platform.busy = true;
             self.running.platform.notice = Some(("正在登录校园跑平台…".into(), false));
         }

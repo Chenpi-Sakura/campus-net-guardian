@@ -39,19 +39,16 @@ account:
   password: "__REPLACE_ME__"   # 门户登录密码
 
 # 校园跑的本机设置；主页临时选校区不会回写默认值
+# 平台接入字段与账号一同在设置页编辑、自动保存；base_url 留空表示禁用平台功能
 running:
   phone: ""
   password: ""
   default_campus: "demo-a"
   # 本地相对米坐标 JSON；留空使用内置校区地图，格式见 config.routes.example.json
   catalog_file: ""
-
-# 校园跑平台接入契约（敏感！仅在本机 config.yaml 填写，修改后重启生效）
-# base_url 留空表示禁用平台登录与记录提交；本地预览始终不连接平台
-running_platform:
   base_url: ""          # 平台服务根地址，必须 https
   app_key: ""           # 平台客户端 appkey
-  app_secret: ""        # 平台请求签名密钥
+  app_secret: ""        # 平台请求签名密钥（敏感！仅本机填写）
   school_id: ""         # 平台学校 ID（数字）
   app_version: "1.8.0"  # 上报的客户端版本号
   brand: ""             # 上报的手机品牌

@@ -31,6 +31,12 @@
     "meters_per_latitude_degree": 111320,
     "projection": "local equirectangular, x east / y north",
     "license": "ODbL-1.0",
-    "attribution": "© OpenStreetMap contributors · ODbL 1.0"
+    "attribution": "© OpenStreetMap contributors · ODbL 1.0",
+    "synthetic_tracks": [
+      {
+        "id": "track-est-1",
+        "note": "标准400米跑道估算几何（直段84.39米、半径36.5米），中心与长轴对齐OSM足球场 way 477890017，非实测数据"
+      }
+    ]
   }
 ]

@@ -36,6 +36,9 @@ pub struct RoutePreset {
     pub name: String,
     /// 按行走顺序排列的节点索引，末尾可重复首节点。
     pub nodes: Vec<usize>,
+    /// 几何为估算绘制而非公开实测数据，界面须如实提示。
+    #[serde(default)]
+    pub estimated: bool,
 }
 /// 合成校区图及路线选项。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -198,11 +201,13 @@ pub fn demo_catalog() -> Catalog {
                     id: "loop-a".into(),
                     name: "环线甲".into(),
                     nodes: vec![0, 1, 2, 3, 0],
+                    estimated: false,
                 },
                 RoutePreset {
                     id: "loop-b".into(),
                     name: "环线乙".into(),
                     nodes: vec![0, 4, 1, 5, 2, 3, 0],
+                    estimated: false,
                 },
             ],
             map: None,
@@ -942,6 +947,7 @@ mod tests {
             id: "open".into(),
             name: "Open synthetic route".into(),
             nodes: vec![0, 1, 2],
+            estimated: false,
         }];
         let r = GenerateRequest {
             preset_id: Some("open".into()),
@@ -993,6 +999,47 @@ mod tests {
                 campuses: vec![bad]
             })
             .is_err()
+        );
+    }
+    #[test]
+    fn longquan_estimated_track_generates_and_is_marked() {
+        let catalog = builtin_catalog().unwrap();
+        let longquan = catalog
+            .campuses
+            .iter()
+            .find(|campus| campus.id == "demo-b")
+            .unwrap();
+        let track = longquan
+            .routes
+            .iter()
+            .find(|route| route.id == "track-est-1")
+            .expect("龙泉应含估算跑道");
+        assert!(track.estimated);
+        let preview = generate(
+            longquan,
+            &GenerateRequest {
+                preset_id: Some("track-est-1".into()),
+                distance_m: 2000,
+                duration_seconds: 1200,
+                noise: Noise::Off,
+                seed: 7,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(preview.distance_m > 1900.0);
+        let airport = catalog
+            .campuses
+            .iter()
+            .find(|campus| campus.id == "demo-a")
+            .unwrap();
+        assert!(
+            airport
+                .routes
+                .iter()
+                .filter(|route| route.id.starts_with("track-"))
+                .all(|route| !route.estimated),
+            "航空港实测跑道不应标记为估算"
         );
     }
 }

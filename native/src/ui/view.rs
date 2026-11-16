@@ -1072,8 +1072,78 @@ fn running_settings(app: &App, compact: bool) -> Element<'_, Message> {
                 "留空使用航空港与龙泉校区底图；本次校区不会修改默认校区。",
                 11.0
             ),
+            muted("平台接入", 11.5),
+            platform_field(
+                "服务地址",
+                "https://…",
+                &running.prefs.base_url,
+                super::running_panel::PlatformField::BaseUrl,
+            ),
+            platform_field(
+                "Appkey",
+                "平台 appkey",
+                &running.prefs.app_key,
+                super::running_panel::PlatformField::AppKey,
+            ),
+            column![
+                label("签名密钥", 12.0),
+                text_input("平台签名密钥", &running.prefs.app_secret)
+                    .size(13)
+                    .padding([8, 10])
+                    .secure(true)
+                    .on_input(|value| {
+                        Message::Running(super::running_panel::Message::PlatformField(
+                            super::running_panel::PlatformField::AppSecret,
+                            value,
+                        ))
+                    })
+                    .style(field)
+            ]
+            .spacing(5),
+            platform_field(
+                "学校 ID",
+                "数字",
+                &running.prefs.school_id,
+                super::running_panel::PlatformField::SchoolId,
+            ),
+            platform_field(
+                "客户端版本",
+                "1.8.0",
+                &running.prefs.app_version,
+                super::running_panel::PlatformField::AppVersion,
+            ),
+            platform_field(
+                "手机品牌",
+                "例如 Xiaomi",
+                &running.prefs.brand,
+                super::running_panel::PlatformField::Brand,
+            ),
+            platform_field(
+                "手机型号",
+                "例如 23127PN0CC",
+                &running.prefs.mobile_type,
+                super::running_panel::PlatformField::MobileType,
+            ),
+            platform_field(
+                "系统版本",
+                "例如 14",
+                &running.prefs.sys_version,
+                super::running_panel::PlatformField::SysVersion,
+            ),
+            platform_field(
+                "设备类型",
+                "1",
+                &running.prefs.device_type,
+                super::running_panel::PlatformField::DeviceType,
+            ),
+            platform_field(
+                "设备令牌",
+                "可留空",
+                &running.prefs.device_token,
+                super::running_panel::PlatformField::DeviceToken,
+            ),
             muted(
-                "平台接入参数在 config.yaml 的 running_platform 段配置，修改后重启生效。",
+                "平台接入与账号一同自动保存；契约修改在下次登录时生效。",
                 11.0
             )
         ]
@@ -1201,6 +1271,9 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
             11.0,
         ));
     }
+    if state.selected_route().id == "@track" && state.active_track_estimated() {
+        metrics = metrics.push(muted("此校区运动场环线为估算几何，非实测数据。", 11.0));
+    }
     if let Some(preview) = &state.preview {
         let km = preview.distance_m / 1000.0;
         let seconds = preview.duration_seconds;
@@ -1285,8 +1358,11 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         .padding([8, 12])
         .style(secondary);
     let platform = &state.platform;
+    let contract_configured = state.prefs.platform_contract().configured();
     let platform_status = if app.preview {
         "平台：离线预览不连接".to_owned()
+    } else if !contract_configured {
+        "平台：未配置，请在设置中填写平台接入".to_owned()
     } else if platform.busy {
         "平台：请求进行中…".to_owned()
     } else if platform.logged_in {
@@ -1299,7 +1375,8 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
     };
     let platform_login = button(centered("登录平台", 12.0))
         .on_press_maybe(
-            (!app.preview && !platform.busy).then_some(Message::Running(RunMessage::PlatformLogin)),
+            (!app.preview && !platform.busy && contract_configured)
+                .then_some(Message::Running(RunMessage::PlatformLogin)),
         )
         .padding([6, 10])
         .style(secondary);
@@ -1383,6 +1460,26 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         )
     ]
     .height(Fill)
+    .into()
+}
+
+fn platform_field<'a>(
+    name: &'static str,
+    placeholder: &'static str,
+    value: &'a str,
+    target: super::running_panel::PlatformField,
+) -> Element<'a, Message> {
+    column![
+        label(name, 12.0),
+        text_input(placeholder, value)
+            .size(13)
+            .padding([8, 10])
+            .on_input(move |value| {
+                Message::Running(super::running_panel::Message::PlatformField(target, value))
+            })
+            .style(field)
+    ]
+    .spacing(5)
     .into()
 }
 

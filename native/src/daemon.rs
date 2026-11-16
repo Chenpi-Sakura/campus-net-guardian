@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{AuthClient, AuthResult},
-    config::{AppConfig, GuiOverrides, PrimaryPatch, RunningPatch},
+    config::{AppConfig, GuiOverrides, PrimaryPatch, RunningPatch, RunningPlatformConfig},
     platform,
     running::Preview,
     running_platform::{
@@ -61,10 +61,11 @@ pub enum Command {
     PrimarySettings(Box<PrimaryPatch>, std::path::PathBuf),
     /// 串行持久化校园跑设置，不修改校园网守护状态。
     RunningSettings(Box<RunningPatch>, std::path::PathBuf),
-    /// 登录校园跑平台并获取运动规则；凭据来自界面最新草稿。
+    /// 登录校园跑平台并获取运动规则；凭据与契约来自界面最新草稿。
     RunPlatformLogin {
         phone: String,
         password: String,
+        contract: Box<RunningPlatformConfig>,
     },
     /// 提交本地预览生成的运动记录；需要先登录平台。
     RunPlatformSubmit {
@@ -151,7 +152,8 @@ fn run(
 ) {
     let mut engine = Engine::new(config, overrides, Instant::now(), start_paused);
     let mut backend = RealBackend(stop.clone());
-    let mut platform_session: Option<(PlatformClient, PlatformLoginInfo)> = None;
+    let mut platform_session: Option<(PlatformClient, PlatformLoginInfo, RunningPlatformConfig)> =
+        None;
     engine.snapshot.autostart = platform::autostart_enabled();
     let log_config = std::cell::RefCell::new(engine.config.logging.clone());
     let mut emit = |event| {
@@ -285,10 +287,14 @@ fn run(
                     }
                 }
             }
-            Ok(Command::RunPlatformLogin { phone, password }) => {
+            Ok(Command::RunPlatformLogin {
+                phone,
+                password,
+                contract,
+            }) => {
                 // 平台会话独立于校园网守护；登录失败清除旧会话，避免使用失效令牌。
                 let result = (|| -> Result<(PlatformClient, PlatformLoginInfo)> {
-                    let mut client = PlatformClient::new(engine.config.running_platform.clone())?;
+                    let mut client = PlatformClient::new(*contract.clone())?;
                     let info = client.login(&phone, &password, &stop)?;
                     Ok((client, info))
                 })();
@@ -296,7 +302,7 @@ fn run(
                     Ok((client, info)) => {
                         emit(Event::Log("校园跑平台登录成功".into()));
                         emit(Event::RunPlatformLogin(Ok(info.clone())));
-                        platform_session = Some((client, info));
+                        platform_session = Some((client, info, *contract));
                     }
                     Err(error) => {
                         platform_session = None;
@@ -307,7 +313,7 @@ fn run(
             }
             Ok(Command::RunPlatformSubmit { campus_id, preview }) => {
                 let result = (|| -> Result<PlatformSubmitInfo> {
-                    let (client, info) = platform_session
+                    let (client, info, contract) = platform_session
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("请先登录校园跑平台"))?;
                     let projection = campus_projection(&campus_id)
@@ -324,8 +330,7 @@ fn run(
                         end_ms,
                         preview.seed,
                     )?;
-                    let body =
-                        record_body(&engine.config.running_platform, info, &preview, &track, now)?;
+                    let body = record_body(contract, info, &preview, &track, now)?;
                     client.submit(&body, &stop)
                 })();
                 match result {

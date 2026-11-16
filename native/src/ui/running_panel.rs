@@ -25,6 +25,20 @@ pub(super) struct Choice {
     pub(super) id: String,
     pub(super) name: String,
 }
+/// 设置页可编辑的平台契约字段。
+#[derive(Clone, Copy)]
+pub(super) enum PlatformField {
+    BaseUrl,
+    AppKey,
+    AppSecret,
+    SchoolId,
+    AppVersion,
+    Brand,
+    MobileType,
+    SysVersion,
+    DeviceType,
+    DeviceToken,
+}
 impl fmt::Display for Choice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.name)
@@ -47,6 +61,7 @@ pub(super) enum Message {
     DefaultCampus(Choice),
     CatalogFile(String),
     LoadCatalog,
+    PlatformField(PlatformField, String),
     PlatformLogin,
     PlatformSubmit,
 }
@@ -68,6 +83,7 @@ impl fmt::Debug for Message {
             Self::DefaultCampus(_) => "RunDefaultCampus",
             Self::CatalogFile(_) => "RunCatalogFile([REDACTED])",
             Self::LoadCatalog => "RunLoadCatalog",
+            Self::PlatformField(_, _) => "RunPlatformField([REDACTED])",
             Self::PlatformLogin => "RunPlatformLogin",
             Self::PlatformSubmit => "RunPlatformSubmit",
         })
@@ -125,6 +141,7 @@ pub(super) struct State {
     job: Option<Job>,
     work_revision: u64,
     seed: u64,
+    submitted_revision: Option<u64>,
 }
 impl State {
     pub(super) fn new(prefs: RunningSettings, base_dir: PathBuf) -> Self {
@@ -164,6 +181,7 @@ impl State {
             job: None,
             work_revision: 0,
             seed,
+            submitted_revision: None,
         };
         state.refresh_map();
         state
@@ -258,13 +276,26 @@ impl State {
                 name: "校园内道路（随机）".into(),
             })
     }
-    /// 可提交的最新预览；草稿过期或无预览时返回 None。
+    /// 可提交的最新预览；草稿过期、无预览或当前预览已提交时返回 None。
     pub(super) fn submission(&self) -> Option<(String, Preview)> {
         let preview = self.preview.as_ref()?;
-        if self.preview_stale {
+        if self.preview_stale || self.submitted_revision == Some(self.revision) {
             return None;
         }
         Some((self.active_id().to_owned(), preview.clone()))
+    }
+    /// 当前校区的运动场环线是否含估算几何，界面须如实提示。
+    pub(super) fn active_track_estimated(&self) -> bool {
+        self.catalog
+            .campuses
+            .iter()
+            .find(|campus| campus.id == self.active_id())
+            .is_some_and(|campus| {
+                campus
+                    .routes
+                    .iter()
+                    .any(|route| route.id.starts_with("track-") && route.estimated)
+            })
     }
     /// 平台登录回执；失败时清除登录态。
     pub(super) fn platform_login_done(&mut self, result: Result<PlatformLoginInfo, String>) {
@@ -288,6 +319,7 @@ impl State {
         self.platform.busy = false;
         match result {
             Ok(info) => {
+                self.submitted_revision = Some(self.revision);
                 let mut text = format!(
                     "记录已提交：编号 {} · 状态 {}",
                     info.record_id, info.result_status
@@ -298,6 +330,7 @@ impl State {
                 if !info.warn_content.is_empty() {
                     text.push_str(&format!(" · 警告：{}", info.warn_content));
                 }
+                text.push_str(" · 重新生成预览后可再次提交");
                 self.platform.notice = Some((text, false));
             }
             Err(error) => self.platform.notice = Some((error, true)),
@@ -572,6 +605,22 @@ impl State {
                 self.invalidate(true);
                 return true;
             }
+            Message::PlatformField(field, value) => {
+                let target = match field {
+                    PlatformField::BaseUrl => &mut self.prefs.base_url,
+                    PlatformField::AppKey => &mut self.prefs.app_key,
+                    PlatformField::AppSecret => &mut self.prefs.app_secret,
+                    PlatformField::SchoolId => &mut self.prefs.school_id,
+                    PlatformField::AppVersion => &mut self.prefs.app_version,
+                    PlatformField::Brand => &mut self.prefs.brand,
+                    PlatformField::MobileType => &mut self.prefs.mobile_type,
+                    PlatformField::SysVersion => &mut self.prefs.sys_version,
+                    PlatformField::DeviceType => &mut self.prefs.device_type,
+                    PlatformField::DeviceToken => &mut self.prefs.device_token,
+                };
+                *target = value;
+                return true;
+            }
             Message::TogglePassword => self.password_visible = !self.password_visible,
             Message::LoadCatalog => self.load_catalog(preview_mode),
             Message::Campus(choice) => {
@@ -835,5 +884,58 @@ mod tests {
         assert!(text.contains("合成警告"));
         s.platform_submit_done(Err("请先登录校园跑平台".into()));
         assert_eq!(s.platform.notice, Some(("请先登录校园跑平台".into(), true)));
+    }
+    #[test]
+    fn successful_submission_locks_preview_until_regeneration() {
+        let mut s = state();
+        let catalog = running::demo_catalog();
+        let preview = running::generate(
+            &catalog.campuses[0],
+            &GenerateRequest {
+                preset_id: None,
+                distance_m: 1000,
+                duration_seconds: 600,
+                noise: Noise::Off,
+                seed: 1,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        s.preview = Some(preview);
+        assert!(s.submission().is_some());
+        s.platform_submit_done(Ok(PlatformSubmitInfo {
+            record_id: 1,
+            result_status: "1".into(),
+            result_desc: String::new(),
+            over_speed_warn: "0".into(),
+            warn_content: String::new(),
+        }));
+        assert!(s.submission().is_none(), "已提交预览不得重复提交");
+        // 重新生成预览会递增 revision，闸门随之解除。
+        s.revision = s.revision.wrapping_add(1);
+        assert!(s.submission().is_some());
+        s.platform_submit_done(Err("合成失败".into()));
+        assert!(s.submission().is_some(), "失败不锁定，可重试");
+    }
+    #[test]
+    fn platform_field_edits_update_prefs_and_debug_redacts_values() {
+        let mut s = state();
+        assert!(s.handle(
+            Message::PlatformField(PlatformField::Brand, "SyntheticBrand".into()),
+            true
+        ));
+        assert_eq!(s.prefs.brand, "SyntheticBrand");
+        assert!(s.handle(
+            Message::PlatformField(PlatformField::AppSecret, "synthetic-secret".into()),
+            true
+        ));
+        assert_eq!(s.prefs.app_secret, "synthetic-secret");
+        assert!(
+            !format!(
+                "{:?}",
+                Message::PlatformField(PlatformField::AppSecret, "synthetic-secret".into())
+            )
+            .contains("synthetic-secret")
+        );
     }
 }

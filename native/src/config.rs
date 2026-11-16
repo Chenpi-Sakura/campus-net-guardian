@@ -19,13 +19,11 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub logging: LoggingConfig,
     pub env_overrides: BTreeMap<String, String>,
-    /// 校园跑账号与默认路线的本机 YAML 配置。
+    /// 校园跑账号、默认路线与平台接入的本机 YAML 配置。
     pub running: RunningSettings,
-    /// 校园跑平台接入契约，仅本机 YAML 配置，修改后重启生效。
-    pub running_platform: RunningPlatformConfig,
 }
 
-/// 校园跑账号与默认赛道设置，仅保存在本机主 YAML 中。
+/// 校园跑账号、默认赛道与平台接入设置，仅保存在本机主 YAML 中。
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct RunningSettings {
@@ -38,6 +36,35 @@ pub struct RunningSettings {
     pub default_campus: String,
     /// 赛道目录文件路径。
     pub catalog_file: String,
+    /// 平台服务根地址，必须为 https；留空表示未配置平台接入。
+    #[serde(deserialize_with = "scalar_string")]
+    pub base_url: String,
+    /// 平台客户端 appkey。
+    #[serde(deserialize_with = "scalar_string")]
+    pub app_key: String,
+    /// 平台请求签名密钥。
+    pub app_secret: String,
+    /// 平台学校 ID。
+    #[serde(deserialize_with = "scalar_string")]
+    pub school_id: String,
+    /// 上报的客户端版本号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub app_version: String,
+    /// 上报的手机品牌。
+    #[serde(deserialize_with = "scalar_string")]
+    pub brand: String,
+    /// 上报的手机型号。
+    #[serde(deserialize_with = "scalar_string")]
+    pub mobile_type: String,
+    /// 上报的手机系统版本。
+    #[serde(deserialize_with = "scalar_string")]
+    pub sys_version: String,
+    /// 上报的设备类型标识。
+    #[serde(deserialize_with = "scalar_string")]
+    pub device_type: String,
+    /// 上报的设备推送令牌，可为空。
+    #[serde(deserialize_with = "scalar_string")]
+    pub device_token: String,
 }
 
 impl Default for RunningSettings {
@@ -47,6 +74,16 @@ impl Default for RunningSettings {
             password: String::new(),
             default_campus: "demo-a".into(),
             catalog_file: String::new(),
+            base_url: String::new(),
+            app_key: String::new(),
+            app_secret: String::new(),
+            school_id: String::new(),
+            app_version: "1.8.0".into(),
+            brand: String::new(),
+            mobile_type: String::new(),
+            sys_version: String::new(),
+            device_type: "1".into(),
+            device_token: String::new(),
         }
     }
 }
@@ -78,7 +115,23 @@ impl RunningSettings {
         {
             bail!("赛道目录文件路径长度或字符无效");
         }
-        Ok(())
+        self.platform_contract().validate()
+    }
+
+    /// 提取平台客户端契约视图；字段仍统一保存在 running 段。
+    pub fn platform_contract(&self) -> RunningPlatformConfig {
+        RunningPlatformConfig {
+            base_url: self.base_url.clone(),
+            app_key: self.app_key.clone(),
+            app_secret: self.app_secret.clone(),
+            school_id: self.school_id.clone(),
+            app_version: self.app_version.clone(),
+            brand: self.brand.clone(),
+            mobile_type: self.mobile_type.clone(),
+            sys_version: self.sys_version.clone(),
+            device_type: self.device_type.clone(),
+            device_token: self.device_token.clone(),
+        }
     }
 
     /// 仅生成相对上一草稿发生变化的校园跑字段。
@@ -90,6 +143,16 @@ impl RunningSettings {
             password: changed(&self.password, &previous.password),
             default_campus: changed(&self.default_campus, &previous.default_campus),
             catalog_file: changed(&self.catalog_file, &previous.catalog_file),
+            base_url: changed(&self.base_url, &previous.base_url),
+            app_key: changed(&self.app_key, &previous.app_key),
+            app_secret: changed(&self.app_secret, &previous.app_secret),
+            school_id: changed(&self.school_id, &previous.school_id),
+            app_version: changed(&self.app_version, &previous.app_version),
+            brand: changed(&self.brand, &previous.brand),
+            mobile_type: changed(&self.mobile_type, &previous.mobile_type),
+            sys_version: changed(&self.sys_version, &previous.sys_version),
+            device_type: changed(&self.device_type, &previous.device_type),
+            device_token: changed(&self.device_token, &previous.device_token),
         }
     }
 }
@@ -105,6 +168,26 @@ pub struct RunningPatch {
     pub default_campus: Option<String>,
     /// 修改赛道目录文件路径。
     pub catalog_file: Option<String>,
+    /// 修改平台服务根地址。
+    pub base_url: Option<String>,
+    /// 修改平台 appkey。
+    pub app_key: Option<String>,
+    /// 修改平台签名密钥。
+    pub app_secret: Option<String>,
+    /// 修改平台学校 ID。
+    pub school_id: Option<String>,
+    /// 修改上报客户端版本号。
+    pub app_version: Option<String>,
+    /// 修改上报手机品牌。
+    pub brand: Option<String>,
+    /// 修改上报手机型号。
+    pub mobile_type: Option<String>,
+    /// 修改上报手机系统版本。
+    pub sys_version: Option<String>,
+    /// 修改上报设备类型。
+    pub device_type: Option<String>,
+    /// 修改上报设备推送令牌。
+    pub device_token: Option<String>,
 }
 
 impl RunningPatch {
@@ -114,6 +197,16 @@ impl RunningPatch {
             && self.password.is_none()
             && self.default_campus.is_none()
             && self.catalog_file.is_none()
+            && self.base_url.is_none()
+            && self.app_key.is_none()
+            && self.app_secret.is_none()
+            && self.school_id.is_none()
+            && self.app_version.is_none()
+            && self.brand.is_none()
+            && self.mobile_type.is_none()
+            && self.sys_version.is_none()
+            && self.device_type.is_none()
+            && self.device_token.is_none()
     }
 
     /// 合并最新 YAML 中的校园跑白名单字段并原子写回。
@@ -143,6 +236,31 @@ impl RunningPatch {
                 .catalog_file
                 .clone()
                 .unwrap_or(typed.running.catalog_file),
+            base_url: self.base_url.clone().unwrap_or(typed.running.base_url),
+            app_key: self.app_key.clone().unwrap_or(typed.running.app_key),
+            app_secret: self.app_secret.clone().unwrap_or(typed.running.app_secret),
+            school_id: self.school_id.clone().unwrap_or(typed.running.school_id),
+            app_version: self
+                .app_version
+                .clone()
+                .unwrap_or(typed.running.app_version),
+            brand: self.brand.clone().unwrap_or(typed.running.brand),
+            mobile_type: self
+                .mobile_type
+                .clone()
+                .unwrap_or(typed.running.mobile_type),
+            sys_version: self
+                .sys_version
+                .clone()
+                .unwrap_or(typed.running.sys_version),
+            device_type: self
+                .device_type
+                .clone()
+                .unwrap_or(typed.running.device_type),
+            device_token: self
+                .device_token
+                .clone()
+                .unwrap_or(typed.running.device_token),
         };
         running.validate()?;
         let root = document
@@ -162,6 +280,16 @@ impl RunningPatch {
             ("password", &running.password),
             ("default_campus", &running.default_campus),
             ("catalog_file", &running.catalog_file),
+            ("base_url", &running.base_url),
+            ("app_key", &running.app_key),
+            ("app_secret", &running.app_secret),
+            ("school_id", &running.school_id),
+            ("app_version", &running.app_version),
+            ("brand", &running.brand),
+            ("mobile_type", &running.mobile_type),
+            ("sys_version", &running.sys_version),
+            ("device_type", &running.device_type),
+            ("device_token", &running.device_token),
         ] {
             section.insert(name.into(), serde_json::Value::String(value.clone()));
         }
@@ -174,38 +302,28 @@ impl RunningPatch {
     }
 }
 
-/// 校园跑平台接入契约，仅保存在本机主 YAML；不实现 Debug 或 Serialize，避免密钥外泄。
-#[derive(Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+/// 平台客户端契约视图，由 RunningSettings 提取；不实现 Debug 或 Serialize，避免密钥外泄。
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunningPlatformConfig {
     /// 平台服务根地址，必须为 https；留空表示未配置平台接入。
-    #[serde(deserialize_with = "scalar_string")]
     pub base_url: String,
     /// 平台客户端 appkey。
-    #[serde(deserialize_with = "scalar_string")]
     pub app_key: String,
     /// 平台请求签名密钥。
     pub app_secret: String,
     /// 平台学校 ID。
-    #[serde(deserialize_with = "scalar_string")]
     pub school_id: String,
     /// 上报的客户端版本号。
-    #[serde(deserialize_with = "scalar_string")]
     pub app_version: String,
     /// 上报的手机品牌。
-    #[serde(deserialize_with = "scalar_string")]
     pub brand: String,
     /// 上报的手机型号。
-    #[serde(deserialize_with = "scalar_string")]
     pub mobile_type: String,
     /// 上报的手机系统版本。
-    #[serde(deserialize_with = "scalar_string")]
     pub sys_version: String,
     /// 上报的设备类型标识。
-    #[serde(deserialize_with = "scalar_string")]
     pub device_type: String,
     /// 上报的设备推送令牌，可为空。
-    #[serde(deserialize_with = "scalar_string")]
     pub device_token: String,
 }
 
@@ -786,43 +904,16 @@ fn restore_known_string_values(document: &mut serde_json::Value, original: &AppC
         ("/running/password", &original.running.password),
         ("/running/default_campus", &original.running.default_campus),
         ("/running/catalog_file", &original.running.catalog_file),
-        (
-            "/running_platform/base_url",
-            &original.running_platform.base_url,
-        ),
-        (
-            "/running_platform/app_key",
-            &original.running_platform.app_key,
-        ),
-        (
-            "/running_platform/app_secret",
-            &original.running_platform.app_secret,
-        ),
-        (
-            "/running_platform/school_id",
-            &original.running_platform.school_id,
-        ),
-        (
-            "/running_platform/app_version",
-            &original.running_platform.app_version,
-        ),
-        ("/running_platform/brand", &original.running_platform.brand),
-        (
-            "/running_platform/mobile_type",
-            &original.running_platform.mobile_type,
-        ),
-        (
-            "/running_platform/sys_version",
-            &original.running_platform.sys_version,
-        ),
-        (
-            "/running_platform/device_type",
-            &original.running_platform.device_type,
-        ),
-        (
-            "/running_platform/device_token",
-            &original.running_platform.device_token,
-        ),
+        ("/running/base_url", &original.running.base_url),
+        ("/running/app_key", &original.running.app_key),
+        ("/running/app_secret", &original.running.app_secret),
+        ("/running/school_id", &original.running.school_id),
+        ("/running/app_version", &original.running.app_version),
+        ("/running/brand", &original.running.brand),
+        ("/running/mobile_type", &original.running.mobile_type),
+        ("/running/sys_version", &original.running.sys_version),
+        ("/running/device_type", &original.running.device_type),
+        ("/running/device_token", &original.running.device_token),
     ] {
         if let Some(current) = document.pointer_mut(path)
             && !current.is_string()
@@ -2231,6 +2322,7 @@ env_overrides: {}
                 password: Some(" synthetic pass ".into()),
                 default_campus: Some("campus_1".into()),
                 catalog_file: Some("tracks.yaml".into()),
+                ..Default::default()
             }
             .save_to(path)
             .unwrap();
@@ -2336,13 +2428,13 @@ env_overrides: {}
     #[test]
     fn running_patch_preserves_platform_contract_and_scalar_school_id() {
         let yaml = format!(
-            "{PRIMARY_YAML}\nrunning:\n  phone: ''\nrunning_platform:\n  base_url: https://platform.test\n  app_key: synthetic-key\n  app_secret: synthetic-secret\n  school_id: 1000\n  brand: SyntheticBrand\n  mobile_type: SyntheticModel\n  sys_version: '14'\n"
+            "{PRIMARY_YAML}\nrunning:\n  phone: ''\n  base_url: https://platform.test\n  app_key: synthetic-key\n  app_secret: synthetic-secret\n  school_id: 1000\n  brand: SyntheticBrand\n  mobile_type: SyntheticModel\n  sys_version: '14'\n"
         );
         with_primary_yaml(&yaml, |path| {
             let loaded: AppConfig =
                 serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(loaded.running_platform.school_id, "1000");
-            assert!(loaded.running_platform.validate().is_ok());
+            assert_eq!(loaded.running.school_id, "1000");
+            assert!(loaded.running.validate().is_ok());
             RunningPatch {
                 phone: Some("12345678901".into()),
                 ..Default::default()
@@ -2352,7 +2444,35 @@ env_overrides: {}
             let saved: AppConfig =
                 serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(saved.running.phone, "12345678901");
-            assert!(saved.running_platform == loaded.running_platform);
+            assert!(saved.running.platform_contract() == loaded.running.platform_contract());
+        });
+    }
+
+    #[test]
+    fn running_patch_saves_platform_fields_and_rejects_invalid_contract() {
+        let yaml = format!(
+            "{PRIMARY_YAML}\nrunning:\n  phone: ''\n  base_url: https://platform.test\n  app_key: synthetic-key\n  app_secret: synthetic-secret\n  school_id: 1000\n  brand: SyntheticBrand\n  mobile_type: SyntheticModel\n  sys_version: '14'\n"
+        );
+        with_primary_yaml(&yaml, |path| {
+            RunningPatch {
+                brand: Some("UpdatedBrand".into()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.brand, "UpdatedBrand");
+            let before = fs::read(path).unwrap();
+            assert!(
+                RunningPatch {
+                    base_url: Some("http://platform.test".into()),
+                    ..Default::default()
+                }
+                .save_to(path)
+                .is_err()
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
         });
     }
 }
