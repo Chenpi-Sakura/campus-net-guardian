@@ -407,12 +407,9 @@ pub struct PlatformClient {
     token: String,
 }
 impl PlatformClient {
-    /// 校验契约后创建客户端；未配置或契约无效时拒绝。
+    /// 校验契约完整性后创建客户端；未配置或字段不全时拒绝。
     pub fn new(contract: RunningPlatformConfig) -> Result<Self> {
-        if !contract.configured() {
-            bail!("平台接入未配置，请在 config.yaml 的 running_platform 段填写后重启");
-        }
-        contract.validate()?;
+        contract.require_complete()?;
         Self::build(contract)
     }
     fn build(contract: RunningPlatformConfig) -> Result<Self> {
@@ -822,6 +819,12 @@ mod tests {
         };
         assert!(PlatformClient::new(broken.clone()).is_err());
         broken.base_url = "https://platform.test".into();
+        let mut incomplete = broken.clone();
+        incomplete.brand.clear();
+        assert!(
+            PlatformClient::new(incomplete).is_err(),
+            "缺设备信息应拒绝登录"
+        );
         assert!(PlatformClient::new(broken).is_ok());
     }
 

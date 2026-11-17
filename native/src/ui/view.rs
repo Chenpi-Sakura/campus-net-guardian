@@ -1358,11 +1358,15 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
         .padding([8, 12])
         .style(secondary);
     let platform = &state.platform;
-    let contract_configured = state.prefs.platform_contract().configured();
+    let contract = state.prefs.platform_contract();
+    let contract_configured = contract.configured();
+    let contract_ready = contract.require_complete().is_ok();
     let platform_status = if app.preview {
         "平台：离线预览不连接".to_owned()
     } else if !contract_configured {
         "平台：未配置，请在设置中填写平台接入".to_owned()
+    } else if !contract_ready {
+        "平台：请补全手机品牌、型号与系统版本".to_owned()
     } else if platform.busy {
         "平台：请求进行中…".to_owned()
     } else if platform.logged_in {
@@ -1375,7 +1379,7 @@ fn running_at_size(app: &App, size: iced::Size) -> Element<'_, Message> {
     };
     let platform_login = button(centered("登录平台", 12.0))
         .on_press_maybe(
-            (!app.preview && !platform.busy && contract_configured)
+            (!app.preview && !platform.busy && contract_ready)
                 .then_some(Message::Running(RunMessage::PlatformLogin)),
         )
         .padding([6, 10])

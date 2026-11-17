@@ -350,7 +350,8 @@ impl RunningPlatformConfig {
         !self.base_url.trim().is_empty()
     }
 
-    /// 校验平台契约，不在错误中包含字段值；未配置视为合法。
+    /// 校验字段格式，不在错误中包含字段值；未配置视为合法。
+    /// 设备信息完整性在登录前由 require_complete 检查，不阻塞设置保存。
     pub fn validate(&self) -> Result<()> {
         if !self.configured() {
             return Ok(());
@@ -377,8 +378,8 @@ impl RunningPlatformConfig {
             bail!("平台学校 ID 必须为数字");
         }
         for value in [&self.brand, &self.mobile_type, &self.sys_version] {
-            if value.trim().is_empty() || value.len() > 128 || value.contains(['\0', '\r', '\n']) {
-                bail!("平台手机品牌、型号与系统版本必须填写");
+            if value.len() > 128 || value.contains(['\0', '\r', '\n']) {
+                bail!("平台手机品牌、型号或系统版本格式无效");
             }
         }
         if self.app_version.trim().is_empty() || self.app_version.len() > 32 {
@@ -389,6 +390,20 @@ impl RunningPlatformConfig {
         }
         if self.device_token.len() > 256 || self.device_token.contains(['\0', '\r', '\n']) {
             bail!("平台设备令牌长度或字符无效");
+        }
+        Ok(())
+    }
+
+    /// 校验平台功能已配置且字段完整；仅在登录等实际使用前调用。
+    pub fn require_complete(&self) -> Result<()> {
+        if !self.configured() {
+            bail!("平台接入未配置，请在设置页填写平台接入");
+        }
+        self.validate()?;
+        for value in [&self.brand, &self.mobile_type, &self.sys_version] {
+            if value.trim().is_empty() {
+                bail!("请补全手机品牌、型号与系统版本");
+            }
         }
         Ok(())
     }
@@ -2410,12 +2425,12 @@ env_overrides: {}
         };
         assert!(valid.configured());
         assert!(valid.validate().is_ok());
+        assert!(valid.require_complete().is_ok());
         for mutate in [
             |c: &mut RunningPlatformConfig| c.base_url = "http://platform.test".into(),
             |c: &mut RunningPlatformConfig| c.base_url = "https://user:pass@platform.test".into(),
             |c: &mut RunningPlatformConfig| c.app_secret.clear(),
             |c: &mut RunningPlatformConfig| c.school_id = "12a".into(),
-            |c: &mut RunningPlatformConfig| c.brand.clear(),
             |c: &mut RunningPlatformConfig| c.mobile_type = "bad\nmodel".into(),
             |c: &mut RunningPlatformConfig| c.app_version.clear(),
         ] {
@@ -2423,6 +2438,12 @@ env_overrides: {}
             mutate(&mut broken);
             assert!(broken.validate().is_err());
         }
+        // 设备信息留空只阻止登录，不阻止设置保存。
+        let mut incomplete = valid.clone();
+        incomplete.brand.clear();
+        assert!(incomplete.validate().is_ok());
+        assert!(incomplete.require_complete().is_err());
+        assert!(RunningPlatformConfig::default().require_complete().is_err());
     }
 
     #[test]
@@ -2473,6 +2494,23 @@ env_overrides: {}
                 .is_err()
             );
             assert_eq!(fs::read(path).unwrap(), before);
+            // 设备信息未填齐只阻止登录，不阻塞账号保存。
+            RunningPatch {
+                brand: Some(String::new()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            RunningPatch {
+                phone: Some("12345678901".into()),
+                ..Default::default()
+            }
+            .save_to(path)
+            .unwrap();
+            let saved: AppConfig =
+                serde_saphyr::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved.running.phone, "12345678901");
+            assert!(saved.running.brand.is_empty());
         });
     }
 }
