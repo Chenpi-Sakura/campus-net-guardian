@@ -56,8 +56,6 @@ diagnose.txt
 
 # Agent 本地工具与沙箱（不可入仓）
 .tools/
-# 残留两个受限 ACL 目录，待管理员权限删除后移除此行
-.codex_tmp/
 
 # 外部应用分析输入
 *.apk
